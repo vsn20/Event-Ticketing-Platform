@@ -14,8 +14,8 @@
 //   PATCH  /api/events/:eventId/pricing → updateSectionPricing (change section price)
 // ============================================================
 
-const { generateSeatsForEvent, updateSectionPrice } = require('../services/seatService');
-const { createEvent, getAllEvents, getEventById } = require('../services/eventService');
+const { generateSeatsForEvent, updateSectionPrice } = require('../service/seatService');
+const { createEvent, getAllEvents, getEventById, updateEvent } = require('../service/eventService');
 
 
 // ============================================================
@@ -50,6 +50,19 @@ async function publishEvent(req, res) {
   const { sectionPricing = {} } = req.body || {};
 
   try {
+    // ----------------------------------------------------------
+    // Validate: sale_window_start must be set before publishing.
+    // Without it the waiting room doesn't know when to open
+    // ticket sales, so we block publishing until it's filled in.
+    // ----------------------------------------------------------
+    const eventData = await getEventById(eventId);
+
+    if (!eventData.sale_window_start) {
+      return res.status(400).json({
+        error: 'Cannot publish: "Sale Window Start" must be set first. Edit the event to add a sale start date.',
+      });
+    }
+
     const result = await generateSeatsForEvent(eventId, sectionPricing);
     res.json({
       message: 'Event published and seats generated',
@@ -151,7 +164,8 @@ async function updateSectionPricing(req, res) {
 // ============================================================
 async function createEventHandler(req, res) {
   const { venueId, name, description, category,
-          startTime, endTime, saleWindowStart, saleWindowEnd } = req.body;
+          startTime, endTime, saleWindowStart, saleWindowEnd,
+          bufferHoursBefore, bufferHoursAfter } = req.body;
 
   // ----------------------------------------------------------
   // Validation: the minimum required fields to create an event.
@@ -198,6 +212,8 @@ async function createEventHandler(req, res) {
       endTime,
       saleWindowStart,
       saleWindowEnd,
+      bufferHoursBefore: bufferHoursBefore !== undefined ? parseFloat(bufferHoursBefore) : 2,
+      bufferHoursAfter: bufferHoursAfter !== undefined ? parseFloat(bufferHoursAfter) : 2,
     });
 
     // 201 Created — a new resource was successfully created.
@@ -228,7 +244,7 @@ async function createEventHandler(req, res) {
 //   200 → array of event objects (with venue name and city)
 // ============================================================
 async function listEventsHandler(req, res) {
-  const { status, city, category } = req.query;
+  const { status, city, category, myEvents } = req.query;
 
   try {
     // ----------------------------------------------------------
@@ -240,6 +256,17 @@ async function listEventsHandler(req, res) {
     if (status) filters.status = status;
     if (city) filters.city = city;
     if (category) filters.category = category;
+
+    // ----------------------------------------------------------
+    // If ?myEvents=true is passed AND the user is an organizer,
+    // automatically filter to only their events. The orgId comes
+    // from the JWT (req.user.id), NOT from the query string —
+    // this prevents organizers from viewing other organizers'
+    // events by guessing an ID.
+    // ----------------------------------------------------------
+    if (myEvents === 'true' && req.user && req.user.role === 'organizer') {
+      filters.orgId = req.user.id;
+    }
 
     const events = await getAllEvents(filters);
     res.json(events);
@@ -279,10 +306,46 @@ async function getEventHandler(req, res) {
 }
 
 
+// ============================================================
+// updateEventHandler(req, res)
+// ============================================================
+// Updates editable fields on an event.
+//
+// PATCH /api/events/:eventId
+//
+// Request body (all optional — only include what you want to change):
+//   {
+//     "name": "New Event Name",
+//     "description": "Updated description",
+//     "category": "Music",
+//     "startTime": "2026-12-01T10:00",
+//     "endTime": "2026-12-01T18:00",
+//     "saleWindowStart": "2026-11-15T00:00",
+//     "saleWindowEnd": "2026-12-01T09:00"
+//   }
+//
+// Security: The organizer's ID comes from the JWT. Only the
+// event's owner can edit it.
+// ============================================================
+async function updateEventHandler(req, res) {
+  const { eventId } = req.params;
+  const updates = req.body;
+
+  try {
+    const updated = await updateEvent(eventId, req.user.id, updates);
+    res.json(updated);
+  } catch (err) {
+    console.error('Failed to update event:', err);
+    res.status(400).json({ error: err.message });
+  }
+}
+
+
 module.exports = {
   createEventHandler,
   listEventsHandler,
   getEventHandler,
+  updateEventHandler,
   publishEvent,
   updateSectionPricing,
 };

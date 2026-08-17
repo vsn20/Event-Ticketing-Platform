@@ -26,7 +26,7 @@ const {
   signupOrganizer,
   loginCustomer,
   loginOrganizer,
-} = require('../services/authService');
+} = require('../service/authService');
 
 
 // ============================================================

@@ -12,7 +12,7 @@
 // on an event page).
 // ============================================================
 
-const { createVenue, getAllVenues, getVenueById } = require('../services/venueService');
+const { createVenue, getAllVenues, getVenueById } = require('../service/venueService');
 
 
 // ============================================================

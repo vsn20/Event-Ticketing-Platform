@@ -7,6 +7,7 @@
 //   POST  /api/events                    → create a new event (draft)
 //   GET   /api/events                    → list events (with optional filters)
 //   GET   /api/events/:eventId           → get a single event's details
+//   PATCH /api/events/:eventId           → update event details (name, dates, etc.)
 //   POST  /api/events/:eventId/publish   → publish event & generate seats
 //   PATCH /api/events/:eventId/pricing   → update a section's price
 //
@@ -29,6 +30,7 @@ const {
   createEventHandler,
   listEventsHandler,
   getEventHandler,
+  updateEventHandler,
   publishEvent,
   updateSectionPricing,
 } = require('../controllers/eventController');
@@ -54,6 +56,15 @@ router.get('/', authenticate, listEventsHandler);
 // Returns: event + venue info + section pricing
 // ----------------------------------------------------------
 router.get('/:eventId', authenticate, getEventHandler);
+
+// ----------------------------------------------------------
+// PATCH /api/events/:eventId — Update event details
+// Protected: must be logged in as an organizer.
+// Only the event's owner can edit it (verified in service layer).
+// Body: { name?, description?, category?, startTime?, endTime?,
+//         saleWindowStart?, saleWindowEnd? }
+// ----------------------------------------------------------
+router.patch('/:eventId', authenticate, requireRole('organizer'), updateEventHandler);
 
 // ----------------------------------------------------------
 // POST /api/events/:eventId/publish — Publish event

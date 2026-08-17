@@ -22,7 +22,8 @@ const pool = require('../config/db');
 
 // ============================================================
 // createEvent({ orgId, venueId, name, description, category,
-//               startTime, endTime, saleWindowStart, saleWindowEnd })
+//               startTime, endTime, saleWindowStart, saleWindowEnd,
+//               bufferHoursBefore, bufferHoursAfter })
 // ============================================================
 // Creates a new event in 'draft' status.
 //
@@ -31,32 +32,31 @@ const pool = require('../config/db');
 //   - Has NO seats generated (that happens at publish time)
 //   - Can be edited freely before publishing
 //
-// The organizer must provide:
-//   - venueId: which venue this event will be held at
-//   - name: the event title
-//   - startTime/endTime: when the event actually happens
+// VENUE CONFLICT CHECK:
+//   Before creating the event, we check if the venue is already
+//   booked during the requested time window. The organizer can
+//   specify buffer hours before and after the event (e.g., 2 hours
+//   before for setup, 2 hours after for teardown). If another
+//   event's time window (including ITS buffer) overlaps with this
+//   event's window (including THIS buffer), the creation is rejected.
 //
-// Optional fields:
-//   - description: longer text about the event
-//   - category: for filtering (Music, Sports, Conference, etc.)
-//   - saleWindowStart/End: when ticket sales open/close
-//     (if not set, the waiting room logic won't activate —
-//     tickets are available immediately when the event is published)
+//   Example: Event A runs 4pm-10pm with 2hr buffer → venue is
+//   blocked 2pm-12am. If Event B tries to book 11pm-1am with 1hr
+//   buffer (so 10pm-2am), it would overlap with Event A's block
+//   and be rejected.
 //
 // The orgId comes from req.user.id (the authenticated organizer),
 // NOT from the request body. This prevents an organizer from
 // creating events under someone else's account.
 // ============================================================
 async function createEvent({ orgId, venueId, name, description, category,
-                             startTime, endTime, saleWindowStart, saleWindowEnd }) {
+                             startTime, endTime, saleWindowStart, saleWindowEnd,
+                             bufferHoursBefore = 2, bufferHoursAfter = 2 }) {
   // ----------------------------------------------------------
-  // Verify the venue exists before creating the event.
-  // If the organizer passes a venueId that doesn't exist,
-  // Postgres would throw a foreign key violation — but we
-  // check here first for a clearer error message.
+  // Step 1: Verify the venue exists.
   // ----------------------------------------------------------
   const venueCheck = await pool.query(
-    'SELECT venue_id FROM venues WHERE venue_id = $1',
+    'SELECT venue_id, venue_name FROM venues WHERE venue_id = $1',
     [venueId]
   );
 
@@ -64,11 +64,52 @@ async function createEvent({ orgId, venueId, name, description, category,
     throw new Error(`Venue with ID ${venueId} does not exist. Create the venue first.`);
   }
 
+  const venueName = venueCheck.rows[0].venue_name;
+
   // ----------------------------------------------------------
-  // Insert the event with status = 'draft'.
-  // The event won't have seats until the organizer calls
-  // POST /api/events/:eventId/publish (which triggers
-  // seatService.generateSeatsForEvent).
+  // Step 2: Check for venue time conflicts.
+  //
+  // We calculate the "blocked window" for the new event:
+  //   blockedStart = startTime - bufferHoursBefore
+  //   blockedEnd   = endTime   + bufferHoursAfter
+  //
+  // Then we check if ANY existing event at this venue has a
+  // blocked window that overlaps with this one.
+  //
+  // Two time ranges [A_start, A_end] and [B_start, B_end]
+  // overlap if and only if: A_start < B_end AND A_end > B_start
+  // (this is the standard interval overlap formula).
+  //
+  // We exclude events with status 'closed' since those are
+  // finished and their venue slot is free again.
+  // ----------------------------------------------------------
+  const conflictCheck = await pool.query(
+    `SELECT e.event_id, e.event_name,
+            e.event_start_time, e.event_end_time
+     FROM events e
+     WHERE e.venue_id = $1
+       AND e.status != 'closed'
+       AND (
+         (e.event_start_time - INTERVAL '2 hours') < ($3::timestamp + ($5 || ' hours')::interval)
+         AND
+         (e.event_end_time + INTERVAL '2 hours') > ($2::timestamp - ($4 || ' hours')::interval)
+       )`,
+    [venueId, startTime, endTime, bufferHoursBefore.toString(), bufferHoursAfter.toString()]
+  );
+
+  if (conflictCheck.rows.length > 0) {
+    const conflict = conflictCheck.rows[0];
+    const conflictStart = new Date(conflict.event_start_time).toLocaleString('en-IN');
+    const conflictEnd = new Date(conflict.event_end_time).toLocaleString('en-IN');
+    throw new Error(
+      `Venue "${venueName}" is already booked! ` +
+      `"${conflict.event_name}" runs from ${conflictStart} to ${conflictEnd}. ` +
+      `With buffer time, the venue is blocked. Choose a different time or venue.`
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Step 3: Insert the event with status = 'draft'.
   // ----------------------------------------------------------
   const result = await pool.query(
     `INSERT INTO events
@@ -186,6 +227,7 @@ async function getEventById(eventId) {
             e.sale_window_start, e.sale_window_end,
             e.created_at, e.updated_at,
             v.venue_id, v.venue_name, v.address, v.city, v.total_capacity,
+            v.seat_layout_json,
             o.org_id, o.org_name
      FROM events e
      JOIN venues v ON e.venue_id = v.venue_id
@@ -230,4 +272,87 @@ async function getEventById(eventId) {
 }
 
 
-module.exports = { createEvent, getAllEvents, getEventById };
+// ============================================================
+// updateEvent(eventId, orgId, updates)
+// ============================================================
+// Updates editable fields on an event. The organizer can change:
+//   - event_name, description, category
+//   - event_start_time, event_end_time
+//   - sale_window_start, sale_window_end
+//
+// SECURITY: We verify that the event belongs to the requesting
+// organizer (orgId from JWT). An organizer cannot edit another
+// organizer's event.
+//
+// NOTE: venue_id is NOT editable after creation — changing the
+// venue would invalidate all generated seats.
+// ============================================================
+async function updateEvent(eventId, orgId, updates) {
+  // ----------------------------------------------------------
+  // Step 1: Verify the event exists and belongs to this organizer
+  // ----------------------------------------------------------
+  const eventCheck = await pool.query(
+    'SELECT event_id, org_id FROM events WHERE event_id = $1',
+    [eventId]
+  );
+
+  if (eventCheck.rows.length === 0) {
+    throw new Error(`Event with ID ${eventId} not found`);
+  }
+
+  if (eventCheck.rows[0].org_id !== orgId) {
+    throw new Error('You do not have permission to edit this event');
+  }
+
+  // ----------------------------------------------------------
+  // Step 2: Build the dynamic UPDATE query.
+  // Only include fields that were actually provided — undefined
+  // fields are NOT updated (preserving existing values).
+  // ----------------------------------------------------------
+  const allowedFields = {
+    name: 'event_name',
+    description: 'description',
+    category: 'category',
+    startTime: 'event_start_time',
+    endTime: 'event_end_time',
+    saleWindowStart: 'sale_window_start',
+    saleWindowEnd: 'sale_window_end',
+  };
+
+  const setClauses = [];
+  const values = [];
+  let paramIndex = 1;
+
+  for (const [key, column] of Object.entries(allowedFields)) {
+    if (updates[key] !== undefined) {
+      setClauses.push(`${column} = $${paramIndex}`);
+      // Allow explicitly setting to null (e.g., clearing sale window)
+      values.push(updates[key] === '' ? null : updates[key]);
+      paramIndex++;
+    }
+  }
+
+  if (setClauses.length === 0) {
+    throw new Error('No fields to update');
+  }
+
+  // Add updated_at timestamp
+  setClauses.push(`updated_at = NOW()`);
+
+  values.push(eventId);
+
+  const result = await pool.query(
+    `UPDATE events
+     SET ${setClauses.join(', ')}
+     WHERE event_id = $${paramIndex}
+     RETURNING event_id, event_name, description, category,
+               event_start_time, event_end_time, status,
+               sale_window_start, sale_window_end, updated_at`,
+    values
+  );
+
+  return result.rows[0];
+}
+
+
+module.exports = { createEvent, getAllEvents, getEventById, updateEvent };
