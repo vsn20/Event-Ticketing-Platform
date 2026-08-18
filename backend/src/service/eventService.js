@@ -90,9 +90,9 @@ async function createEvent({ orgId, venueId, name, description, category,
      WHERE e.venue_id = $1
        AND e.status != 'closed'
        AND (
-         (e.event_start_time - INTERVAL '2 hours') < ($3::timestamp + ($5 || ' hours')::interval)
+         (e.event_start_time - (COALESCE(e.buffer_hours_before, 2) || ' hours')::interval) < ($3::timestamp + ($5 || ' hours')::interval)
          AND
-         (e.event_end_time + INTERVAL '2 hours') > ($2::timestamp - ($4 || ' hours')::interval)
+         (e.event_end_time + (COALESCE(e.buffer_hours_after, 2) || ' hours')::interval) > ($2::timestamp - ($4 || ' hours')::interval)
        )`,
     [venueId, startTime, endTime, bufferHoursBefore.toString(), bufferHoursAfter.toString()]
   );
@@ -114,13 +114,16 @@ async function createEvent({ orgId, venueId, name, description, category,
   const result = await pool.query(
     `INSERT INTO events
        (org_id, venue_id, event_name, description, category,
-        event_start_time, event_end_time, sale_window_start, sale_window_end)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        event_start_time, event_end_time, sale_window_start, sale_window_end,
+        buffer_hours_before, buffer_hours_after)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING event_id, org_id, venue_id, event_name, description, category,
                event_start_time, event_end_time, status,
-               sale_window_start, sale_window_end, created_at`,
+               sale_window_start, sale_window_end,
+               buffer_hours_before, buffer_hours_after, created_at`,
     [orgId, venueId, name, description || null, category || null,
-      startTime, endTime, saleWindowStart || null, saleWindowEnd || null]
+      startTime, endTime, saleWindowStart || null, saleWindowEnd || null,
+      bufferHoursBefore, bufferHoursAfter]
   );
 
   return result.rows[0];
@@ -246,6 +249,7 @@ async function getEventById(eventId) {
     `SELECT e.event_id, e.event_name, e.description, e.category,
             e.event_start_time, e.event_end_time, e.status,
             e.sale_window_start, e.sale_window_end,
+            e.buffer_hours_before, e.buffer_hours_after,
             e.created_at, e.updated_at,
             v.venue_id, v.venue_name, v.address, v.total_capacity,
             v.seat_layout_json,
@@ -340,6 +344,8 @@ async function updateEvent(eventId, orgId, updates) {
     endTime: 'event_end_time',
     saleWindowStart: 'sale_window_start',
     saleWindowEnd: 'sale_window_end',
+    bufferHoursBefore: 'buffer_hours_before',
+    bufferHoursAfter: 'buffer_hours_after',
   };
 
   const setClauses = [];
@@ -370,7 +376,8 @@ async function updateEvent(eventId, orgId, updates) {
      WHERE event_id = $${paramIndex}
      RETURNING event_id, event_name, description, category,
                event_start_time, event_end_time, status,
-               sale_window_start, sale_window_end, updated_at`,
+               sale_window_start, sale_window_end,
+               buffer_hours_before, buffer_hours_after, updated_at`,
     values
   );
 

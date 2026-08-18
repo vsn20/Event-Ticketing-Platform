@@ -134,6 +134,10 @@ export default function Navbar() {
                     style={{ color: '#c7d2fe' }}>
                 Dashboard
               </Link>
+              <Link href="/organizer/venues/create" className="text-sm no-underline px-3 py-1.5 rounded-lg"
+                    style={{ color: '#c7d2fe' }}>
+                Create Venue
+              </Link>
               <Link href="/organizer/events/create" className="text-sm no-underline px-3 py-1.5 rounded-lg"
                     style={{ color: '#c7d2fe' }}>
                 Create Event

@@ -103,9 +103,37 @@ export default function EventsPage() {
   // authLoading] changed. The authLoading check ensures we don't
   // fire the API call before the auth token is loaded from
   // localStorage (which would result in a 401 error).
+  //
+  // RACE CONDITION GUARD:
+  //   AuthContext sets `user` and flips `authLoading` to false in
+  //   the SAME effect/commit. That means on the render where the
+  //   customer's session is restored, TWO effects fire back to
+  //   back: the "apply default city" effect (which calls
+  //   setCityId(...) but doesn't take effect until the next
+  //   render) and this fetch effect (which still closes over the
+  //   OLD cityId, 'all', because state hasn't updated yet).
+  //
+  //   Concretely, right after login/refresh this fires:
+  //     Request A: GET /events                (cityId still 'all')
+  //     Request B: GET /events?cityId=<home>  (after cityId updates)
+  //   two requests in flight for the same effect key. Without a
+  //   guard, whichever response arrives LAST wins — and since the
+  //   unfiltered request (A) usually returns more rows, it can
+  //   easily resolve after the filtered one (B) and silently
+  //   overwrite it. That's the bug: the dropdown shows the
+  //   customer's home city, but the grid shows unfiltered events.
+  //
+  //   The fix is the standard React pattern: each effect run gets
+  //   its own `ignore` flag via the cleanup function. If a newer
+  //   effect run has started before an older request resolves, the
+  //   older run's `ignore` is set to true in its cleanup, and its
+  //   setEvents/setError/setLoading calls are skipped. Only the
+  //   response belonging to the LATEST filters is ever applied.
   // ----------------------------------------------------------
   useEffect(() => {
     if (authLoading) return; // Wait for auth to initialize
+
+    let ignore = false;
 
     async function fetchEvents() {
       setLoading(true);
@@ -128,15 +156,29 @@ export default function EventsPage() {
         }
 
         const data = await api.get(`/events?${params.toString()}`);
+
+        // A newer effect run (e.g. cityId changed again since this
+        // request was fired) has already superseded this one —
+        // discard this stale response instead of applying it.
+        if (ignore) return;
+
         setEvents(data);
       } catch (err) {
+        if (ignore) return;
         setError(err.message);
       } finally {
-        setLoading(false);
+        if (!ignore) setLoading(false);
       }
     }
 
     fetchEvents();
+
+    // Cleanup runs before the next effect execution (or on unmount).
+    // Marks this run's in-flight request as stale so its result is
+    // ignored if it resolves after a newer request has started.
+    return () => {
+      ignore = true;
+    };
   }, [category, cityId, authLoading]);
 
   return (

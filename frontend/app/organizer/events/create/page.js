@@ -1,62 +1,50 @@
 // ============================================================
 // Create Event Page — /organizer/events/create
 //
-// A multi-step form for organizers to:
-//   Step 1: Select an existing venue OR create a new one
-//   Step 2: Fill in event details (name, dates, category)
-//   Step 3: Review and submit
+// A focused form for organizers to create a new event:
+//   1. Select an existing venue from a dropdown
+//   2. Fill in event details (name, dates, category, buffer time)
+//   3. Submit → creates event as draft → redirect to manage page
 //
-// This page connects to TWO backend endpoints:
-//   - POST /api/venues (to create a new venue if needed)
-//   - POST /api/events (to create the event as a draft)
+// Venue creation is now on a separate page:
+//   /organizer/venues/create
 //
-// After creating the event, the organizer is redirected to
-// the event management page where they can publish it.
+// API calls:
+//   GET  /api/venues  → populate venue dropdown
+//   POST /api/events  → create the event as draft
 // ============================================================
 
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
 
 // Pre-defined categories for the dropdown
 const CATEGORIES = ['Music', 'Sports', 'Conference', 'Comedy', 'Theatre', 'Festival', 'Other'];
 
-export default function CreateEventPage() {
+// Wrap in Suspense because useSearchParams requires it in Next.js 16
+export default function CreateEventPageWrapper() {
+  return (
+    <Suspense fallback={<div className="page-container py-8">Loading...</div>}>
+      <CreateEventPage />
+    </Suspense>
+  );
+}
+
+function CreateEventPage() {
   const { user, loading: authLoading } = useAuth();
   const router = useRouter();
+  const searchParams = useSearchParams();
 
-  // ----------------------------------------------------------
-  // VENUE STATE
-  // The organizer can either pick an existing venue or create
-  // a new one. venueMode toggles which form is shown.
-  // ----------------------------------------------------------
-  const [venueMode, setVenueMode] = useState('select'); // 'select' or 'create'
+  // Venue selection
   const [venues, setVenues] = useState([]);
   const [selectedVenueId, setSelectedVenueId] = useState('');
+  const [venuesLoading, setVenuesLoading] = useState(true);
 
-  // Cities dropdown data — used both to show each existing venue's
-  // city in the "select" list, and to populate the city dropdown
-  // in the "create new venue" form below.
-  const [cities, setCities] = useState([]);
-
-  // New venue form fields.
-  // venueCityId replaces the old free-text venueCity — it's the
-  // selected <option> value from a dropdown fed by GET /api/cities
-  // (fetched below), matching the backend's city_id foreign key.
-  const [venueName, setVenueName] = useState('');
-  const [venueAddress, setVenueAddress] = useState('');
-  const [venueCityId, setVenueCityId] = useState('');
-  const [venueSections, setVenueSections] = useState([
-    // Start with one section by default. The organizer can add more.
-    { name: 'General', rows: 'A,B,C', seatsPerRow: 20, defaultPrice: 50 },
-  ]);
-
-  // ----------------------------------------------------------
-  // EVENT STATE
-  // ----------------------------------------------------------
+  // Event form fields
   const [eventName, setEventName] = useState('');
   const [description, setDescription] = useState('');
   const [category, setCategory] = useState('');
@@ -65,28 +53,22 @@ export default function CreateEventPage() {
   const [saleWindowStart, setSaleWindowStart] = useState('');
   const [saleWindowEnd, setSaleWindowEnd] = useState('');
 
-  // Buffer hours — how long before and after the event the venue
-  // should be blocked (for setup/teardown/cleaning etc.)
+  // Buffer hours for venue conflict check
   const [bufferHoursBefore, setBufferHoursBefore] = useState(2);
   const [bufferHoursAfter, setBufferHoursAfter] = useState(2);
 
   // UI state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [venuesLoading, setVenuesLoading] = useState(true);
 
-  // ----------------------------------------------------------
   // Redirect non-organizers
-  // ----------------------------------------------------------
   useEffect(() => {
     if (!authLoading && (!user || user.role !== 'organizer')) {
       router.push('/organizer/login');
     }
   }, [user, authLoading, router]);
 
-  // ----------------------------------------------------------
   // Fetch existing venues for the dropdown
-  // ----------------------------------------------------------
   useEffect(() => {
     if (authLoading || !user) return;
 
@@ -104,113 +86,58 @@ export default function CreateEventPage() {
     fetchVenues();
   }, [authLoading, user]);
 
-  // ----------------------------------------------------------
-  // Fetch the list of cities for the venue-creation dropdown.
-  // Public endpoint, but we still wait for auth to settle first
-  // just to keep this effect's timing consistent with the others
-  // on this page.
-  // ----------------------------------------------------------
+  // Auto-select newly created venue if redirected from venue creation
   useEffect(() => {
-    if (authLoading || !user) return;
-
-    async function fetchCities() {
-      try {
-        const data = await api.get('/cities');
-        setCities(data);
-      } catch (err) {
-        console.error('Failed to load cities:', err);
-      }
+    const newVenueId = searchParams.get('newVenueId');
+    if (newVenueId && venues.length > 0) {
+      setSelectedVenueId(newVenueId);
     }
+  }, [searchParams, venues]);
 
-    fetchCities();
-  }, [authLoading, user]);
-
-  // ----------------------------------------------------------
-  // addSection — adds a new empty section to the venue form
-  // ----------------------------------------------------------
-  function addSection() {
-    setVenueSections([
-      ...venueSections,
-      { name: '', rows: '', seatsPerRow: 10, defaultPrice: 0 },
-    ]);
-  }
-
-  // ----------------------------------------------------------
-  // removeSection — removes a section by index
-  // ----------------------------------------------------------
-  function removeSection(index) {
-    setVenueSections(venueSections.filter((_, i) => i !== index));
-  }
-
-  // ----------------------------------------------------------
-  // updateSection — updates a field in a specific section
-  // ----------------------------------------------------------
-  function updateSection(index, field, value) {
-    const updated = [...venueSections];
-    updated[index] = { ...updated[index], [field]: value };
-    setVenueSections(updated);
-  }
-
-  // ----------------------------------------------------------
-  // handleSubmit — creates the venue (if new) and then the event
-  // ----------------------------------------------------------
+  // Handle event creation
   async function handleSubmit(e) {
     e.preventDefault();
     setError('');
+
+    // Client-side validation
+    if (!selectedVenueId) {
+      setError('Please select a venue.');
+      return;
+    }
+    if (!eventName.trim()) {
+      setError('Event name is required.');
+      return;
+    }
+    if (!startTime || !endTime) {
+      setError('Start time and end time are required.');
+      return;
+    }
+    if (new Date(endTime) <= new Date(startTime)) {
+      setError('End time must be after start time.');
+      return;
+    }
+    if (saleWindowStart && saleWindowEnd && new Date(saleWindowEnd) <= new Date(saleWindowStart)) {
+      setError('Sale window end must be after sale window start.');
+      return;
+    }
+
     setLoading(true);
 
     try {
-      let venueId = selectedVenueId;
-
-      // ---- Step 1: Create venue if in "create" mode ----
-      if (venueMode === 'create') {
-        // Convert the section form data into the seat_layout_json format
-        // that the backend expects.
-        const seatLayoutJson = {
-          sections: venueSections.map((s) => ({
-            name: s.name,
-            // Convert comma-separated row string "A,B,C" into array ["A","B","C"]
-            rows: s.rows.split(',').map((r) => r.trim()).filter(Boolean),
-            seats_per_row: parseInt(s.seatsPerRow) || 10,
-            default_price: parseFloat(s.defaultPrice) || 0,
-          })),
-        };
-
-        // cityId is required by the backend (see venueController.js
-        // validation) — there's no "undefined" fallback here the
-        // way there is for the optional address field.
-        const venueData = await api.post('/venues', {
-          name: venueName,
-          address: venueAddress || undefined,
-          cityId: venueCityId,
-          seatLayoutJson: seatLayoutJson,
-        });
-
-        venueId = venueData.venue_id;
-      }
-
-      if (!venueId) {
-        setError('Please select or create a venue.');
-        setLoading(false);
-        return;
-      }
-
-      // ---- Step 2: Create the event as a draft ----
-      const eventData = await api.post('/events', {
-        venueId: parseInt(venueId),
-        name: eventName,
+      const event = await api.post('/events', {
+        venueId: parseInt(selectedVenueId),
+        name: eventName.trim(),
         description: description || undefined,
         category: category || undefined,
         startTime,
         endTime,
         saleWindowStart: saleWindowStart || undefined,
         saleWindowEnd: saleWindowEnd || undefined,
-        bufferHoursBefore: parseFloat(bufferHoursBefore) || 2,
-        bufferHoursAfter: parseFloat(bufferHoursAfter) || 2,
+        bufferHoursBefore,
+        bufferHoursAfter,
       });
 
-      // Redirect to the event management page where they can publish
-      router.push(`/organizer/events/${eventData.event_id}`);
+      router.push(`/organizer/events/${event.event_id}`);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -218,268 +145,211 @@ export default function CreateEventPage() {
     }
   }
 
+  // Guards
   if (authLoading || !user || user.role !== 'organizer') return null;
 
+  // Find selected venue to show preview
+  const selectedVenue = venues.find(v => String(v.venue_id) === String(selectedVenueId));
+
   return (
-    <div className="page-container py-8 animate-fade-in">
+    <div className="page-container py-8 animate-fade-in max-w-2xl">
+
+      {/* Back link */}
+      <Link href="/organizer/dashboard" className="text-sm no-underline mb-6 inline-block"
+        style={{ color: 'var(--text-secondary)' }}>
+        ← Back to Dashboard
+      </Link>
+
       <h1 className="text-3xl font-bold mb-2">Create New Event</h1>
       <p className="text-sm mb-8" style={{ color: 'var(--text-secondary)' }}>
-        Set up your venue and event details. You can publish and set pricing later.
+        Select a venue and fill in the event details. The event will be saved as a draft.
       </p>
 
-      <form onSubmit={handleSubmit} className="max-w-2xl">
+      <form onSubmit={handleSubmit}>
 
         {/* ============================================================
-            SECTION 1: VENUE SELECTION
+            VENUE SELECTION
             ============================================================ */}
         <div className="card p-6 mb-6" style={{ cursor: 'default' }}>
-          <h2 className="text-lg font-semibold mb-4">📍 Venue</h2>
+          <h2 className="text-sm font-semibold uppercase mb-4"
+            style={{ color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            🏟️ Select Venue
+          </h2>
 
-          {/* Toggle between select/create */}
-          <div className="flex rounded-lg overflow-hidden mb-5"
-            style={{ border: '1px solid var(--border-color)' }}>
-            <button type="button"
-              onClick={() => setVenueMode('select')}
-              className="flex-1 py-2.5 text-sm font-medium transition-all"
-              style={{
-                background: venueMode === 'select' ? 'var(--color-primary)' : 'transparent',
-                color: venueMode === 'select' ? 'white' : 'var(--text-secondary)',
-              }}>
-              Select Existing
-            </button>
-            <button type="button"
-              onClick={() => setVenueMode('create')}
-              className="flex-1 py-2.5 text-sm font-medium transition-all"
-              style={{
-                background: venueMode === 'create' ? 'var(--color-primary)' : 'transparent',
-                color: venueMode === 'create' ? 'white' : 'var(--text-secondary)',
-              }}>
-              Create New
-            </button>
-          </div>
+          {venuesLoading ? (
+            <div className="flex items-center gap-2">
+              <div className="spinner" style={{ width: 18, height: 18 }}></div>
+              <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading venues...</span>
+            </div>
+          ) : venues.length === 0 ? (
+            <div className="text-center py-6">
+              <p className="text-sm mb-3" style={{ color: 'var(--text-secondary)' }}>
+                No venues available. Create a venue first.
+              </p>
+              <Link href="/organizer/venues/create" className="btn-primary no-underline text-sm">
+                + Create Venue
+              </Link>
+            </div>
+          ) : (
+            <>
+              <select className="input" value={selectedVenueId}
+                onChange={(e) => setSelectedVenueId(e.target.value)} required>
+                <option value="" disabled>Choose a venue...</option>
+                {venues.map((v) => (
+                  <option key={v.venue_id} value={v.venue_id}>
+                    {v.venue_name} — {v.city_name || 'No city'} ({v.total_capacity || '?'} seats)
+                  </option>
+                ))}
+              </select>
 
-          {/* ---- SELECT existing venue ---- */}
-          {venueMode === 'select' && (
-            <div>
-              {venuesLoading ? (
-                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading venues...</p>
-              ) : venues.length === 0 ? (
-                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
-                  No venues yet. Switch to &quot;Create New&quot; to add one.
-                </p>
-              ) : (
-                <div>
-                  <label className="label">Select a venue</label>
-                  <select
-                    className="input"
-                    value={selectedVenueId}
-                    onChange={(e) => setSelectedVenueId(e.target.value)}
-                    required={venueMode === 'select'}
-                  >
-                    <option value="">Choose a venue...</option>
-                    {venues.map((v) => (
-                      <option key={v.venue_id} value={v.venue_id}>
-                        {/* v.city_name comes from the backend's JOIN
-                            to the cities table (see venueService.js) */}
-                        {v.venue_name} — {v.city_name || 'No city'} ({v.total_capacity || '?'} seats)
-                      </option>
-                    ))}
-                  </select>
+              {/* Venue preview when selected */}
+              {selectedVenue && (
+                <div className="mt-3 p-3 rounded-lg text-xs"
+                  style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+                  <strong>{selectedVenue.venue_name}</strong>
+                  {selectedVenue.city_name && <span> · {selectedVenue.city_name}</span>}
+                  {selectedVenue.total_capacity && <span> · {selectedVenue.total_capacity} seats</span>}
+                  {selectedVenue.seat_layout_json?.sections && (
+                    <span> · Sections: {selectedVenue.seat_layout_json.sections.map(s => s.name).join(', ')}</span>
+                  )}
                 </div>
               )}
-            </div>
-          )}
 
-          {/* ---- CREATE new venue ---- */}
-          {venueMode === 'create' && (
-            <div className="flex flex-col gap-4">
-              <div>
-                <label className="label">Venue Name</label>
-                <input type="text" className="input" placeholder="Bangalore Indoor Stadium"
-                  value={venueName} onChange={(e) => setVenueName(e.target.value)} required />
+              <div className="mt-3">
+                <Link href="/organizer/venues/create"
+                  className="text-xs no-underline"
+                  style={{ color: 'var(--color-primary)' }}>
+                  + Create a new venue instead
+                </Link>
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="label">Address <span style={{ color: 'var(--text-muted)' }}>(optional)</span></label>
-                  <input type="text" className="input" placeholder="123 Stadium Road"
-                    value={venueAddress} onChange={(e) => setVenueAddress(e.target.value)} />
-                </div>
-                <div>
-                  <label className="label">City</label>
-                  {/* Required dropdown, not free text — matches the
-                      backend's city_id foreign key (migration 003).
-                      Options come from GET /api/cities, fetched above. */}
-                  <select className="input" value={venueCityId}
-                    onChange={(e) => setVenueCityId(e.target.value)} required>
-                    <option value="" disabled>Select a city</option>
-                    {cities.map((c) => (
-                      <option key={c.city_id} value={c.city_id}>
-                        {c.city_name}{c.state ? `, ${c.state}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              {/* Sections builder */}
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <label className="label mb-0">Seating Sections</label>
-                  <button type="button" onClick={addSection}
-                    className="text-xs font-medium px-3 py-1 rounded-full"
-                    style={{ background: 'var(--color-primary-light)', color: 'var(--color-primary)' }}>
-                    + Add Section
-                  </button>
-                </div>
-
-                {venueSections.map((section, i) => (
-                  <div key={i} className="p-4 rounded-lg mb-3"
-                    style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
-                    <div className="flex items-center justify-between mb-3">
-                      <span className="text-sm font-medium">Section {i + 1}</span>
-                      {venueSections.length > 1 && (
-                        <button type="button" onClick={() => removeSection(i)}
-                          className="text-xs" style={{ color: 'var(--color-error)' }}>
-                          Remove
-                        </button>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="label text-xs">Section Name</label>
-                        <input type="text" className="input text-sm py-2" placeholder="VIP"
-                          value={section.name}
-                          onChange={(e) => updateSection(i, 'name', e.target.value)} required />
-                      </div>
-                      <div>
-                        <label className="label text-xs">Rows (comma-separated)</label>
-                        <input type="text" className="input text-sm py-2" placeholder="A,B,C"
-                          value={section.rows}
-                          onChange={(e) => updateSection(i, 'rows', e.target.value)} required />
-                      </div>
-                      <div>
-                        <label className="label text-xs">Seats per Row</label>
-                        <input type="number" className="input text-sm py-2" min="1"
-                          value={section.seatsPerRow}
-                          onChange={(e) => updateSection(i, 'seatsPerRow', e.target.value)} required />
-                      </div>
-                      <div>
-                        <label className="label text-xs">Default Price (₹)</label>
-                        <input type="number" className="input text-sm py-2" min="0" step="0.01"
-                          value={section.defaultPrice}
-                          onChange={(e) => updateSection(i, 'defaultPrice', e.target.value)} required />
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            </>
           )}
         </div>
 
+
         {/* ============================================================
-            SECTION 2: EVENT DETAILS
+            EVENT DETAILS
             ============================================================ */}
         <div className="card p-6 mb-6" style={{ cursor: 'default' }}>
-          <h2 className="text-lg font-semibold mb-4">🎪 Event Details</h2>
+          <h2 className="text-sm font-semibold uppercase mb-4"
+            style={{ color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            📝 Event Details
+          </h2>
+
           <div className="flex flex-col gap-4">
+            {/* Event Name */}
             <div>
-              <label className="label">Event Name</label>
-              <input type="text" className="input" placeholder="Rock Concert 2026"
-                value={eventName} onChange={(e) => setEventName(e.target.value)} required />
+              <label className="label">Event Name *</label>
+              <input type="text" className="input" required
+                placeholder="e.g. Rock Concert 2026"
+                value={eventName}
+                onChange={(e) => setEventName(e.target.value)} />
             </div>
+
+            {/* Description */}
             <div>
               <label className="label">Description <span style={{ color: 'var(--text-muted)' }}>(optional)</span></label>
-              <textarea className="input" rows={3} placeholder="Tell attendees what to expect..."
-                value={description} onChange={(e) => setDescription(e.target.value)}
-                style={{ resize: 'vertical' }} />
+              <textarea className="input" rows={3} style={{ resize: 'vertical' }}
+                placeholder="Describe the event..."
+                value={description}
+                onChange={(e) => setDescription(e.target.value)} />
             </div>
+
+            {/* Category */}
             <div>
               <label className="label">Category <span style={{ color: 'var(--text-muted)' }}>(optional)</span></label>
-              <select className="input" value={category} onChange={(e) => setCategory(e.target.value)}>
-                <option value="">Select a category...</option>
+              <select className="input" value={category}
+                onChange={(e) => setCategory(e.target.value)}>
+                <option value="">Select category...</option>
                 {CATEGORIES.map((cat) => (
                   <option key={cat} value={cat}>{cat}</option>
                 ))}
               </select>
             </div>
+
+            {/* Start + End Time */}
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="label">Start Time</label>
-                <input type="datetime-local" className="input"
-                  value={startTime} onChange={(e) => setStartTime(e.target.value)} required />
+                <label className="label">Start Time *</label>
+                <input type="datetime-local" className="input" required
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)} />
               </div>
               <div>
-                <label className="label">End Time</label>
-                <input type="datetime-local" className="input"
-                  value={endTime} onChange={(e) => setEndTime(e.target.value)} required />
+                <label className="label">End Time *</label>
+                <input type="datetime-local" className="input" required
+                  value={endTime}
+                  min={startTime || undefined}
+                  onChange={(e) => setEndTime(e.target.value)} />
               </div>
             </div>
           </div>
         </div>
 
+
         {/* ============================================================
-            SECTION 3: SALE WINDOW (optional)
+            SALE WINDOW + BUFFER TIME
             ============================================================ */}
         <div className="card p-6 mb-6" style={{ cursor: 'default' }}>
-          <h2 className="text-lg font-semibold mb-1">🕐 Sale Window</h2>
+          <h2 className="text-sm font-semibold uppercase mb-2"
+            style={{ color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            ⏰ Sale Window & Buffer Time
+          </h2>
           <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-            Optional — when should ticket sales open and close? This controls the waiting room activation.
+            Optional now — you can set these later from the manage page before publishing.
           </p>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="label">Sales Open</label>
-              <input type="datetime-local" className="input"
-                value={saleWindowStart} onChange={(e) => setSaleWindowStart(e.target.value)} />
+
+          <div className="flex flex-col gap-4">
+            {/* Sale Window */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Sales Open</label>
+                <input type="datetime-local" className="input"
+                  value={saleWindowStart}
+                  onChange={(e) => setSaleWindowStart(e.target.value)} />
+              </div>
+              <div>
+                <label className="label">Sales Close</label>
+                <input type="datetime-local" className="input"
+                  value={saleWindowEnd}
+                  onChange={(e) => setSaleWindowEnd(e.target.value)} />
+              </div>
             </div>
-            <div>
-              <label className="label">Sales Close</label>
-              <input type="datetime-local" className="input"
-                value={saleWindowEnd} onChange={(e) => setSaleWindowEnd(e.target.value)} />
+
+            {/* Buffer Hours */}
+            <div className="p-4 rounded-lg"
+              style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+              <p className="text-sm font-medium mb-1">🔒 Venue Buffer Time</p>
+              <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+                How long before and after the event the venue should be blocked
+                (for setup, teardown, cleaning, etc.)
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="label text-xs">Hours Before Event</label>
+                  <input type="number" className="input text-sm py-2"
+                    min="0" max="24" step="0.5"
+                    value={bufferHoursBefore}
+                    onChange={(e) => setBufferHoursBefore(parseFloat(e.target.value) || 0)} />
+                </div>
+                <div>
+                  <label className="label text-xs">Hours After Event</label>
+                  <input type="number" className="input text-sm py-2"
+                    min="0" max="24" step="0.5"
+                    value={bufferHoursAfter}
+                    onChange={(e) => setBufferHoursAfter(parseFloat(e.target.value) || 0)} />
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        {/* ============================================================
-            SECTION 4: VENUE BUFFER TIME
-            ============================================================ */}
-        <div className="card p-6 mb-6" style={{ cursor: 'default' }}>
-          <h2 className="text-lg font-semibold mb-1">🔒 Venue Buffer Time</h2>
-          <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
-            Block the venue before and after your event (setup, teardown, cleaning).
-            Other organizers won&apos;t be able to book overlapping slots.
-          </p>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="label">Hours Before Event</label>
-              <input type="number" className="input" min="0" max="24" step="0.5"
-                value={bufferHoursBefore}
-                onChange={(e) => setBufferHoursBefore(e.target.value)} />
-              <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>For setup / sound check</p>
-            </div>
-            <div>
-              <label className="label">Hours After Event</label>
-              <input type="number" className="input" min="0" max="24" step="0.5"
-                value={bufferHoursAfter}
-                onChange={(e) => setBufferHoursAfter(e.target.value)} />
-              <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>For teardown / cleaning</p>
-            </div>
-          </div>
-        </div>
 
-        {/* ---- Error message ---- */}
+        {/* ---- Error + Submit ---- */}
         {error && <div className="error-message mb-4">{error}</div>}
 
-        {/* ---- Submit button ---- */}
-        <button type="submit" className="btn-primary w-full" disabled={loading}>
-          {loading ? (
-            <span className="flex items-center justify-center gap-2">
-              <span className="spinner" style={{ width: 18, height: 18 }}></span>
-              Creating event...
-            </span>
-          ) : (
-            'Create Event as Draft'
-          )}
+        <button type="submit" className="btn-primary w-full py-3.5" disabled={loading || !selectedVenueId}>
+          {loading ? 'Creating Event...' : '📝 Create Event as Draft'}
         </button>
 
         <p className="text-xs text-center mt-3" style={{ color: 'var(--text-muted)' }}>

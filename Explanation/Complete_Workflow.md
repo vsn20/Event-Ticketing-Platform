@@ -162,125 +162,190 @@ This separation means the service layer is reusable (e.g., a CLI tool or cron jo
 
 ### 4.1 Authentication Flow
 
-```mermaid
-sequenceDiagram
-    participant C as Client (Browser)
-    participant S as Express Server
-    participant DB as PostgreSQL
+**How signup works (step by step):**
 
-    Note over C,DB: === SIGNUP ===
-    C->>S: POST /api/auth/customer/signup<br/>{name, email, password}
-    S->>S: bcrypt.hash(password, 10)<br/>→ password_hash
-    S->>DB: INSERT INTO customers<br/>(name, email, password_hash)
-    DB-->>S: customer_id
-    S->>S: jwt.sign({id, role:'customer'},<br/>SECRET, {expiresIn:'7d'})
-    S-->>C: 201 {token, user}
-
-    Note over C,DB: === LOGIN ===
-    C->>S: POST /api/auth/customer/login<br/>{email, password}
-    S->>DB: SELECT * FROM customers<br/>WHERE email = $1
-    DB-->>S: customer row
-    S->>S: bcrypt.compare(password,<br/>password_hash)
-    S->>S: jwt.sign({id, role:'customer'})
-    S-->>C: 200 {token, user}
-
-    Note over C,DB: === PROTECTED REQUEST ===
-    C->>S: GET /api/events<br/>Authorization: Bearer {token}
-    S->>S: jwt.verify(token, SECRET)<br/>→ req.user = {id, role}
-    S->>DB: SELECT FROM events...
-    DB-->>S: events array
-    S-->>C: 200 [events]
-```
-
-### 4.2 Event Creation + Venue Conflict Check
-
-```mermaid
-sequenceDiagram
-    participant O as Organizer
-    participant S as Express Server
-    participant DB as PostgreSQL
-
-    O->>S: POST /api/events<br/>{venueId, name, startTime,<br/>endTime, bufferHoursBefore: 2,<br/>bufferHoursAfter: 2}
-
-    S->>DB: Does venue exist?<br/>SELECT FROM venues WHERE venue_id=$1
-    DB-->>S: ✅ Yes (venue_name = "Stadium X")
-
-    Note over S,DB: CONFLICT CHECK
-    S->>DB: SELECT FROM events<br/>WHERE venue_id = $1<br/>AND status != 'closed'<br/>AND time ranges overlap<br/>(including buffer hours)
-
-    alt No conflict
-        DB-->>S: 0 rows (no overlap)
-        S->>DB: INSERT INTO events<br/>(status = 'draft')
-        DB-->>S: new event
-        S-->>O: 201 {event}
-    else Conflict found
-        DB-->>S: 1 row (existing event)
-        S-->>O: 400 "Venue 'Stadium X'<br/>is already booked!"
-    end
-```
-
-**Buffer time example:**
-- Event runs **4pm–10pm** with **2hr buffer before**, **2hr buffer after**
-- Venue is blocked **2pm–12am (midnight)**
-- Any other event overlapping this window is rejected
-
-### 4.3 Event Publishing + Seat Generation
-
-```mermaid
-sequenceDiagram
-    participant O as Organizer
-    participant S as Express Server
-    participant DB as PostgreSQL
-
-    O->>S: POST /api/events/3/publish<br/>{sectionPricing: {VIP:200, General:75}}
-
-    S->>DB: GET event (check sale_window_start)
-    alt sale_window_start is NULL
-        S-->>O: 400 "Cannot publish:<br/>Sale Window Start must be set"
-    else sale_window_start is set
-        S->>DB: SELECT seat_layout_json<br/>FROM venues WHERE venue_id = event.venue_id
-        DB-->>S: {sections: [{name:"VIP",rows:["A","B"],<br/>seats_per_row:10}, ...]}
-
-        loop For each section in layout
-            loop For each row in section
-                loop For each seat 1..seats_per_row
-                    S->>DB: INSERT INTO seats<br/>(event_id, section, row_label,<br/>seat_number, price, status='available')
-                end
-            end
-            S->>DB: INSERT INTO event_section_pricing<br/>(event_id, section, price)
-        end
-
-        S->>DB: UPDATE events SET status='published'<br/>WHERE event_id = 3
-        S-->>O: 200 {message, seatsCreated: 50}
-    end
-```
-
-### 4.4 Organizer Privacy (Dashboard)
+1. Customer fills the signup form (name, email, password, city)
+2. Frontend sends `POST /api/auth/customer/signup`
+3. Backend hashes the password with `bcrypt` (10 salt rounds)
+4. Backend inserts the customer into the database
+5. Backend creates a JWT token (expires in 7 days)
+6. Returns `{ token, user }` → frontend saves to localStorage
 
 ```mermaid
 flowchart TD
-    A["Organizer A logs in\n→ JWT contains org_id=1"]
-    B["Dashboard calls\nGET /api/events?myEvents=true"]
-    C["Backend reads JWT → org_id = 1"]
-    D["SQL: WHERE e.org_id = 1"]
-    E["Returns ONLY org A's events"]
+    A["1️⃣ Customer fills form\nname, email, password, city"]
+    B["2️⃣ Frontend sends\nPOST /api/auth/customer/signup"]
+    C["3️⃣ Backend hashes password\nbcrypt.hash - 10 salt rounds"]
+    D["4️⃣ INSERT INTO customers\nname, email, password_hash, city_id"]
+    E["5️⃣ Create JWT token\njwt.sign - id, role, 7 days expiry"]
+    F["6️⃣ Return token + user info\nFrontend saves to localStorage"]
+    G["7️⃣ Redirect to /events\nNavbar shows customer name"]
 
-    F["Organizer B logs in\n→ JWT contains org_id=2"]
-    G["Dashboard calls\nGET /api/events?myEvents=true"]
-    H["Backend reads JWT → org_id = 2"]
-    I["SQL: WHERE e.org_id = 2"]
-    J["Returns ONLY org B's events"]
+    A --> B --> C --> D --> E --> F --> G
 
-    A --> B --> C --> D --> E
-    F --> G --> H --> I --> J
+    style C fill:#f59e0b,stroke:#d97706,color:#fff
+    style E fill:#6366f1,stroke:#4f46e5,color:#fff
+    style G fill:#10b981,stroke:#059669,color:#fff
+```
+
+**How login works:**
+
+Same flow, but instead of hashing + inserting, the backend:
+- Looks up the customer by email
+- Compares the submitted password against the stored hash using `bcrypt.compare()`
+- If match → creates JWT and returns it
+- If no match → returns 401 "Invalid credentials"
+
+**How protected routes work:**
+
+```mermaid
+flowchart LR
+    A["Frontend sends request\nwith Authorization header"]
+    B["Middleware: jwt.verify\nExtracts id + role"]
+    C{"Valid\ntoken?"}
+    D["req.user = id, role\nContinue to controller"]
+    E["401 Unauthorized\nRequest rejected"]
+
+    A --> B --> C
+    C -- yes --> D
+    C -- no --> E
+
+    style D fill:#10b981,stroke:#059669,color:#fff
+    style E fill:#ef4444,stroke:#dc2626,color:#fff
+```
+
+Every API request from the frontend includes `Authorization: Bearer <token>` in the header (added automatically by `api.js`). The middleware decodes the JWT and sets `req.user = { id, role }` so controllers know who is making the request.
+
+---
+
+### 4.2 Event Creation + Venue Conflict Check
+
+**What happens when an organizer creates an event:**
+
+```mermaid
+flowchart TD
+    A["1️⃣ Organizer selects venue\nand fills event details"]
+    B["2️⃣ POST /api/events\nvenueId, name, startTime, endTime\nbufferBefore: 2h, bufferAfter: 2h"]
+    C["3️⃣ Backend checks:\nDoes this venue exist?"]
+    D{"4️⃣ Venue\nexists?"}
+    E["❌ Error: Venue not found"]
+    F["5️⃣ Calculate blocked window:\nstart - 2h to end + 2h"]
+    G["6️⃣ Check for overlapping events\nat same venue in same window"]
+    H{"7️⃣ Any\noverlap?"}
+    I["❌ Error: Venue already booked!\nShows conflicting event name + times"]
+    J["8️⃣ INSERT event as DRAFT\nNo seats generated yet"]
+    K["✅ Return new event\nRedirect to manage page"]
+
+    A --> B --> C --> D
+    D -- no --> E
+    D -- yes --> F --> G --> H
+    H -- yes --> I
+    H -- no --> J --> K
+
+    style E fill:#ef4444,stroke:#dc2626,color:#fff
+    style F fill:#f59e0b,stroke:#d97706,color:#fff
+    style I fill:#ef4444,stroke:#dc2626,color:#fff
+    style K fill:#10b981,stroke:#059669,color:#fff
+```
+
+**Buffer time example:**
+
+| | Time |
+|---|---|
+| Buffer starts | 2:00 PM (2h before event) |
+| **Event starts** | **4:00 PM** |
+| **Event ends** | **10:00 PM** |
+| Buffer ends | 12:00 AM midnight (2h after event) |
+| **Venue blocked** | **2:00 PM → 12:00 AM** |
+
+Any other event whose blocked window overlaps this range → **rejected**.
+
+---
+
+### 4.3 Event Publishing + Seat Generation
+
+**What happens when an organizer clicks "Publish":**
+
+```mermaid
+flowchart TD
+    A["1️⃣ Organizer sets prices\nper section: VIP=200, General=75"]
+    B["2️⃣ POST /api/events/3/publish\nwith sectionPricing object"]
+    C{"3️⃣ Is sale_window_start\nalready set?"}
+    D["❌ Error: Set the sale window\nstart date before publishing"]
+    E["4️⃣ Load venue's seat_layout_json\nSections → Rows → Seats per row"]
+    F["5️⃣ Generate individual seats\nOne row per seat in the DB"]
+    G["6️⃣ Example: VIP has rows A,B\nwith 10 seats each = 20 seats"]
+    H["7️⃣ Save section pricing\nevent_section_pricing table"]
+    I["8️⃣ Update event status\ndraft → published"]
+    J["✅ Done! 50 seats created\nEvent now visible to customers"]
+
+    A --> B --> C
+    C -- no --> D
+    C -- yes --> E --> F --> G --> H --> I --> J
 
     style D fill:#ef4444,stroke:#dc2626,color:#fff
-    style I fill:#ef4444,stroke:#dc2626,color:#fff
-    style E fill:#10b981,stroke:#059669,color:#fff
+    style F fill:#6366f1,stroke:#4f46e5,color:#fff
+    style I fill:#f59e0b,stroke:#d97706,color:#fff
     style J fill:#10b981,stroke:#059669,color:#fff
 ```
 
-**Key**: The orgId comes from the **JWT token**, not from query parameters. This prevents Organizer A from passing `?orgId=2` to see Organizer B's events.
+**Seat generation detail:**
+
+The venue's `seat_layout_json` looks like this:
+```json
+{
+  "sections": [
+    { "name": "VIP", "rows": ["A", "B"], "seats_per_row": 10, "default_price": 150 },
+    { "name": "General", "rows": ["C", "D", "E"], "seats_per_row": 10, "default_price": 50 }
+  ]
+}
+```
+
+This generates **50 individual seat rows** in the `seats` table:
+
+| seat_id | section | row | seat_number | price | status |
+|---------|---------|-----|-------------|-------|--------|
+| 1 | VIP | A | 1 | 200 | available |
+| 2 | VIP | A | 2 | 200 | available |
+| ... | ... | ... | ... | ... | ... |
+| 20 | VIP | B | 10 | 200 | available |
+| 21 | General | C | 1 | 75 | available |
+| ... | ... | ... | ... | ... | ... |
+| 50 | General | E | 10 | 75 | available |
+
+Notice the prices (200, 75) come from the organizer's `sectionPricing` input, not the venue's `default_price`. If the organizer didn't set a price for a section, the venue's default is used as fallback.
+
+---
+
+### 4.4 Organizer Privacy (Dashboard)
+
+**How we prevent organizers from seeing each other's events:**
+
+```mermaid
+flowchart TD
+    A["Organizer A logs in\nJWT contains org_id = 1"]
+    B["Dashboard loads\nGET /api/events?myEvents=true"]
+    C["Backend extracts org_id\nfrom JWT token, NOT from URL"]
+    D["SQL: WHERE e.org_id = 1"]
+    E["✅ Returns only\nOrg A's events"]
+
+    F["Organizer B logs in\nJWT contains org_id = 2"]
+    G["Dashboard loads\nGET /api/events?myEvents=true"]
+    H["SQL: WHERE e.org_id = 2"]
+    I["✅ Returns only\nOrg B's events"]
+
+    A --> B --> C --> D --> E
+    F --> G --> H --> I
+
+    style D fill:#ef4444,stroke:#dc2626,color:#fff
+    style H fill:#ef4444,stroke:#dc2626,color:#fff
+    style E fill:#10b981,stroke:#059669,color:#fff
+    style I fill:#10b981,stroke:#059669,color:#fff
+```
+
+**Why this is secure:**
+
+The `org_id` filter comes from the **JWT token** (set by the server when the organizer logged in), NOT from the query string. Even if Organizer A manually edited the URL to include `?orgId=2`, the backend ignores that and reads the org_id from the verified JWT instead. There's no way to spoof it without the server's JWT secret.
 
 ---
 
@@ -302,15 +367,17 @@ frontend/app/
 │   └── EventCard.js       ← Reusable card for event listings
 ├── auth/
 │   ├── login/page.js      ← Customer login
-│   └── signup/page.js     ← Customer signup
+│   └── signup/page.js     ← Customer signup (with city dropdown)
 ├── organizer/
 │   ├── login/page.js      ← Organizer login + signup (tab toggle)
 │   ├── dashboard/page.js  ← My events only (privacy filtered)
+│   ├── venues/
+│   │   └── create/page.js ← Create venue with section builder
 │   └── events/
-│       ├── create/page.js ← Create venue + event + buffer time
+│       ├── create/page.js ← Select venue + create event
 │       └── [id]/page.js   ← Edit details + publish + inline pricing
 └── events/
-    ├── page.js            ← Browse published events (filter by category/city)
+    ├── page.js            ← Browse published events (filter by city/category)
     └── [id]/page.js       ← Event detail page (customer view)
 ```
 

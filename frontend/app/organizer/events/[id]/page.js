@@ -48,6 +48,28 @@ function toInputDate(dateString) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// ============================================================
+// Helper: build the edit form "buffer" from event data
+//
+// This is called in three places — on initial load, when
+// entering edit mode, and when cancelling edit mode — so the
+// form always starts from a fresh snapshot of the saved event
+// data rather than carrying over stale unsaved edits.
+// ============================================================
+function buildEditForm(data) {
+  return {
+    name: data.event_name || '',
+    description: data.description || '',
+    category: data.category || '',
+    startTime: toInputDate(data.event_start_time),
+    endTime: toInputDate(data.event_end_time),
+    saleWindowStart: toInputDate(data.sale_window_start),
+    saleWindowEnd: toInputDate(data.sale_window_end),
+    bufferHoursBefore: data.buffer_hours_before ?? 2,
+    bufferHoursAfter: data.buffer_hours_after ?? 2,
+  };
+}
+
 // Status badge helper
 function getStatusBadge(status) {
   const map = {
@@ -123,16 +145,8 @@ export default function ManageEventPage() {
         setSectionPrices(prices);
       }
 
-      // Initialize edit form with current values
-      setEditForm({
-        name: data.event_name || '',
-        description: data.description || '',
-        category: data.category || '',
-        startTime: toInputDate(data.event_start_time),
-        endTime: toInputDate(data.event_end_time),
-        saleWindowStart: toInputDate(data.sale_window_start),
-        saleWindowEnd: toInputDate(data.sale_window_end),
-      });
+      // Initialize edit form buffer with current values
+      setEditForm(buildEditForm(data));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -152,6 +166,22 @@ export default function ManageEventPage() {
     setSaving(true);
     setSaveResult('');
     setError('');
+
+    // Client-side date validation
+    if (editForm.startTime && editForm.endTime) {
+      if (new Date(editForm.endTime) <= new Date(editForm.startTime)) {
+        setError('End time must be after start time.');
+        setSaving(false);
+        return;
+      }
+    }
+    if (editForm.saleWindowStart && editForm.saleWindowEnd) {
+      if (new Date(editForm.saleWindowEnd) <= new Date(editForm.saleWindowStart)) {
+        setError('Sale window end must be after sale window start.');
+        setSaving(false);
+        return;
+      }
+    }
 
     try {
       await api.patch(`/events/${params.id}`, editForm);
@@ -261,7 +291,7 @@ export default function ManageEventPage() {
 
       {/* ---- Back link ---- */}
       <Link href="/organizer/dashboard" className="text-sm no-underline mb-6 inline-block"
-            style={{ color: 'var(--text-secondary)' }}>
+        style={{ color: 'var(--text-secondary)' }}>
         ← Back to Dashboard
       </Link>
 
@@ -283,12 +313,19 @@ export default function ManageEventPage() {
       <div className="card p-6 mb-6" style={{ cursor: 'default' }}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-semibold uppercase"
-              style={{ color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+            style={{ color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
             Event Details
           </h2>
           {!editing ? (
             <button
-              onClick={() => { setEditing(true); setSaveResult(''); }}
+              onClick={() => {
+                // Reset the buffer from the current saved event data
+                // every time edit mode is (re)entered, so stale
+                // unsaved edits from a previous session never show up.
+                setEditForm(buildEditForm(event));
+                setEditing(true);
+                setSaveResult('');
+              }}
               className="text-xs font-medium px-3 py-1.5 rounded-lg"
               style={{ background: 'var(--color-primary-light)', color: 'var(--color-primary)' }}
             >
@@ -301,7 +338,13 @@ export default function ManageEventPage() {
                 style={{ background: 'var(--color-primary)', color: 'white' }}>
                 {saving ? 'Saving...' : '💾 Save'}
               </button>
-              <button onClick={() => setEditing(false)}
+              <button
+                onClick={() => {
+                  // Discard unsaved changes: reset the buffer back to
+                  // the last saved event data before leaving edit mode.
+                  setEditForm(buildEditForm(event));
+                  setEditing(false);
+                }}
                 className="text-xs font-medium px-3 py-1.5 rounded-lg"
                 style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}>
                 Cancel
@@ -354,6 +397,14 @@ export default function ManageEventPage() {
               <span style={{ color: 'var(--text-muted)' }}>Sale Closes:</span>{' '}
               <span className="font-medium">{formatDate(event.sale_window_end)}</span>
             </div>
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>Buffer Before:</span>{' '}
+              <span className="font-medium">{event.buffer_hours_before ?? 2}h</span>
+            </div>
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>Buffer After:</span>{' '}
+              <span className="font-medium">{event.buffer_hours_after ?? 2}h</span>
+            </div>
             {event.description && (
               <div className="col-span-2">
                 <span style={{ color: 'var(--text-muted)' }}>Description:</span>{' '}
@@ -399,6 +450,7 @@ export default function ManageEventPage() {
                 <label className="label">End Time</label>
                 <input type="datetime-local" className="input"
                   value={editForm.endTime}
+                  min={editForm.startTime || undefined}
                   onChange={(e) => setEditForm({ ...editForm, endTime: e.target.value })} />
               </div>
             </div>
@@ -413,11 +465,36 @@ export default function ManageEventPage() {
                 <label className="label">Sale Window Closes</label>
                 <input type="datetime-local" className="input"
                   value={editForm.saleWindowEnd}
+                  min={editForm.saleWindowStart || undefined}
                   onChange={(e) => setEditForm({ ...editForm, saleWindowEnd: e.target.value })} />
               </div>
             </div>
+            {/* Buffer Hours */}
+            <div className="p-4 rounded-lg"
+              style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+              <p className="text-sm font-medium mb-1">🔒 Venue Buffer Time</p>
+              <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+                Setup/teardown time that blocks the venue around the event.
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="label text-xs">Hours Before</label>
+                  <input type="number" className="input text-sm py-2"
+                    min="0" max="24" step="0.5"
+                    value={editForm.bufferHoursBefore}
+                    onChange={(e) => setEditForm({ ...editForm, bufferHoursBefore: parseFloat(e.target.value) || 0 })} />
+                </div>
+                <div>
+                  <label className="label text-xs">Hours After</label>
+                  <input type="number" className="input text-sm py-2"
+                    min="0" max="24" step="0.5"
+                    value={editForm.bufferHoursAfter}
+                    onChange={(e) => setEditForm({ ...editForm, bufferHoursAfter: parseFloat(e.target.value) || 0 })} />
+                </div>
+              </div>
+            </div>
             <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-              Venue cannot be changed after creation. Sale window dates can be set or updated anytime.
+              Venue cannot be changed after creation. All other fields can be updated anytime.
             </p>
           </div>
         )}
@@ -442,8 +519,8 @@ export default function ManageEventPage() {
             <div className="flex flex-col gap-3 mb-5">
               {sections.map((section) => (
                 <div key={section.name}
-                     className="flex items-center gap-4 p-4 rounded-lg"
-                     style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+                  className="flex items-center gap-4 p-4 rounded-lg"
+                  style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
                   <div className="flex-1">
                     <p className="font-semibold text-sm">{section.name}</p>
                     <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
@@ -504,8 +581,8 @@ export default function ManageEventPage() {
           <div className="flex flex-col gap-2">
             {event.sectionPricing.map((sp) => (
               <div key={sp.section}
-                   className="flex items-center justify-between p-4 rounded-lg"
-                   style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+                className="flex items-center justify-between p-4 rounded-lg"
+                style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
 
                 {/* Section name and current price */}
                 <div className="flex items-center gap-4 flex-1">
