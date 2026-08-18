@@ -6,7 +6,15 @@
 //   - Email (required)
 //   - Password (required)
 //   - Phone (optional)
-//   - Default location (optional — pre-fills event search filter)
+//   - Default City (required — picked from a dropdown, pre-fills
+//     the event listing's city filter on every login)
+//
+// The city dropdown is populated from GET /api/cities on page
+// load — NOT hardcoded in the frontend. This means the list of
+// selectable cities always matches whatever the backend's
+// `cities` table currently contains, so adding a new city later
+// (a simple database INSERT) shows up here automatically with
+// no frontend code change needed.
 //
 // On success, automatically logs the user in (saves the JWT)
 // and redirects to the events page — no need to log in again
@@ -15,7 +23,7 @@
 
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
@@ -30,11 +38,40 @@ export default function CustomerSignupPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [phone, setPhone] = useState('');
-  const [defaultLocation, setDefaultLocation] = useState('');
+  const [defaultCityId, setDefaultCityId] = useState('');
+
+  // City dropdown data — fetched once on mount from the public
+  // /api/cities endpoint (no auth needed, since the user isn't
+  // logged in yet at signup time).
+  const [cities, setCities] = useState([]);
+  const [citiesLoading, setCitiesLoading] = useState(true);
 
   // UI state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // ----------------------------------------------------------
+  // Fetch the list of cities once, when the page first loads.
+  // This populates the <select> dropdown below. An empty
+  // dependency array ([]) means this effect runs exactly once,
+  // not on every re-render.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    async function fetchCities() {
+      try {
+        const data = await api.get('/cities');
+        setCities(data);
+      } catch (err) {
+        // Non-fatal: the form still works, the dropdown will just
+        // be empty and the user will see the error above the form.
+        setError('Could not load city list. Please refresh the page.');
+      } finally {
+        setCitiesLoading(false);
+      }
+    }
+
+    fetchCities();
+  }, []);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -44,13 +81,15 @@ export default function CustomerSignupPage() {
     try {
       // Call the backend signup endpoint.
       // The backend hashes the password, creates the customer,
-      // and returns a JWT + user info.
+      // and returns a JWT + user info (including the resolved
+      // city name for defaultCityId, so the UI can display it
+      // immediately without a second lookup).
       const data = await api.post('/auth/customer/signup', {
         name,
         email,
         password,
         phone: phone || undefined,
-        defaultLocation: defaultLocation || undefined,
+        defaultCityId: defaultCityId || undefined,
       });
 
       // Auto-login: save the token and redirect.
@@ -137,19 +176,31 @@ export default function CustomerSignupPage() {
             />
           </div>
 
-          {/* Default Location (optional) */}
+          {/* Default City — required, picked from a dropdown fed
+              by GET /api/cities. This becomes the city the event
+              listing filters by default whenever this customer
+              logs in. */}
           <div>
-            <label htmlFor="signup-location" className="label">
-              Default City <span style={{ color: 'var(--text-muted)' }}>(optional — pre-filters events)</span>
+            <label htmlFor="signup-city" className="label">
+              Default City <span style={{ color: 'var(--text-muted)' }}>(used to pre-filter events near you)</span>
             </label>
-            <input
-              id="signup-location"
-              type="text"
+            <select
+              id="signup-city"
               className="input"
-              placeholder="Bangalore"
-              value={defaultLocation}
-              onChange={(e) => setDefaultLocation(e.target.value)}
-            />
+              value={defaultCityId}
+              onChange={(e) => setDefaultCityId(e.target.value)}
+              required
+              disabled={citiesLoading}
+            >
+              <option value="" disabled>
+                {citiesLoading ? 'Loading cities…' : 'Select your city'}
+              </option>
+              {cities.map((c) => (
+                <option key={c.city_id} value={c.city_id}>
+                  {c.city_name}{c.state ? `, ${c.state}` : ''}
+                </option>
+              ))}
+            </select>
           </div>
 
           {error && <div className="error-message">{error}</div>}

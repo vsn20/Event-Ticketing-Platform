@@ -164,8 +164,8 @@ async function updateSectionPricing(req, res) {
 // ============================================================
 async function createEventHandler(req, res) {
   const { venueId, name, description, category,
-          startTime, endTime, saleWindowStart, saleWindowEnd,
-          bufferHoursBefore, bufferHoursAfter } = req.body;
+    startTime, endTime, saleWindowStart, saleWindowEnd,
+    bufferHoursBefore, bufferHoursAfter } = req.body;
 
   // ----------------------------------------------------------
   // Validation: the minimum required fields to create an event.
@@ -232,8 +232,17 @@ async function createEventHandler(req, res) {
 //
 // Query parameters (all optional):
 //   ?status=published  → only show published events
-//   ?city=Bangalore    → only show events in Bangalore
+//   ?cityId=3          → only show events in that city (its ID)
+//   ?cityId=all        → explicitly show events in every city
 //   ?category=Music    → only show music events
+//
+// `cityId` replaces the old free-text `city` param — it's now
+// an exact match against the venue's city_id (see migration 003
+// and eventService.getAllEvents for the full reasoning). The
+// frontend's customer dashboard defaults this to the logged-in
+// customer's own default_city_id (returned at login/signup), and
+// switches to "all" or another city's ID when the customer
+// changes the dropdown.
 //
 // For organizers viewing their own dashboard, the route can
 // pass orgId from req.user.id to show only their events
@@ -241,20 +250,23 @@ async function createEventHandler(req, res) {
 // events are shown.
 //
 // Returns:
-//   200 → array of event objects (with venue name and city)
+//   200 → array of event objects (with venue name and city name)
 // ============================================================
 async function listEventsHandler(req, res) {
-  const { status, city, category, myEvents } = req.query;
+  const { status, cityId, category, myEvents } = req.query;
 
   try {
     // ----------------------------------------------------------
     // Build the filters object from query parameters.
     // Only include a filter if it was actually provided —
     // undefined values are ignored by the service layer.
+    // Note: cityId is passed through as-is (including the
+    // literal string "all") — getAllEvents() handles the "all"
+    // case by skipping the city filter entirely.
     // ----------------------------------------------------------
     const filters = {};
     if (status) filters.status = status;
-    if (city) filters.city = city;
+    if (cityId) filters.cityId = cityId;
     if (category) filters.category = category;
 
     // ----------------------------------------------------------

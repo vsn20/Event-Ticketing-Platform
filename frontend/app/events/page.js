@@ -7,16 +7,27 @@
 // Features:
 //   - Fetches events from GET /api/events on page load
 //   - Filter buttons for category (Music, Sports, Conference, etc.)
-//   - Search by city
+//   - City filter DROPDOWN (fed by GET /api/cities), defaulting
+//     to the logged-in customer's own default city
 //   - Shows loading state while fetching
 //   - Shows empty state if no events match the filters
 //
-// API called: GET /api/events?status=published&city=X&category=Y
+// API called: GET /api/events?status=published&cityId=X&category=Y
+//
+// CITY FILTER DEFAULT BEHAVIOR:
+//   The first time this page loads for a logged-in customer, the
+//   city dropdown is pre-set to `user.defaultCityId` (the city
+//   they picked at signup, returned on every login). This is what
+//   "by default filtering should be based on the address" means
+//   in practice — the customer sees events near them immediately,
+//   without touching any filter. They can then freely change the
+//   dropdown to "All" or any other city for that session; we
+//   don't overwrite their choice again once they've changed it.
 // ============================================================
 
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
 import EventCard from '@/app/components/EventCard';
@@ -31,21 +42,67 @@ export default function EventsPage() {
   // Data state
   const [events, setEvents] = useState([]);
 
-  // Filter state
+  // City dropdown data — fetched once from the public /api/cities
+  // endpoint, same as the signup page.
+  const [cities, setCities] = useState([]);
+
+  // Filter state.
+  // cityId starts as 'all' (no filter) until we know the logged-in
+  // customer's default city — see the effect below that sets it
+  // the FIRST time `user` becomes available.
   const [category, setCategory] = useState('All');
-  const [city, setCity] = useState('');
+  const [cityId, setCityId] = useState('all');
+
+  // Tracks whether we've already applied the customer's default
+  // city once, so we don't keep resetting their manual dropdown
+  // choice back to their home city on every re-render.
+  const didApplyDefaultCity = useRef(false);
 
   // UI state
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
   // ----------------------------------------------------------
+  // Fetch the city dropdown options once on mount.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    async function fetchCities() {
+      try {
+        const data = await api.get('/cities');
+        setCities(data);
+      } catch {
+        // Non-fatal — the "All" option and category filters still work
+        // even if the city dropdown fails to load.
+      }
+    }
+
+    fetchCities();
+  }, []);
+
+  // ----------------------------------------------------------
+  // Apply the logged-in customer's default city to the filter,
+  // but ONLY ONCE — the first time `user` becomes available after
+  // auth finishes loading. Using a ref (didApplyDefaultCity)
+  // instead of a plain state check prevents this from firing
+  // again and clobbering the dropdown if the customer manually
+  // switches to a different city afterward.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (authLoading) return;
+
+    if (user?.defaultCityId && !didApplyDefaultCity.current) {
+      setCityId(String(user.defaultCityId));
+      didApplyDefaultCity.current = true;
+    }
+  }, [user, authLoading]);
+
+  // ----------------------------------------------------------
   // Fetch events whenever filters change.
   //
-  // useEffect runs after every render where [category, city, authLoading]
-  // changed. The authLoading check ensures we don't fire the
-  // API call before the auth token is loaded from localStorage
-  // (which would result in a 401 error).
+  // useEffect runs after every render where [category, cityId,
+  // authLoading] changed. The authLoading check ensures we don't
+  // fire the API call before the auth token is loaded from
+  // localStorage (which would result in a 401 error).
   // ----------------------------------------------------------
   useEffect(() => {
     if (authLoading) return; // Wait for auth to initialize
@@ -64,8 +121,10 @@ export default function EventsPage() {
           params.set('category', category);
         }
 
-        if (city.trim()) {
-          params.set('city', city.trim());
+        // 'all' means "don't filter by city" — we simply omit the
+        // param, same effect as the backend's explicit "all" handling.
+        if (cityId && cityId !== 'all') {
+          params.set('cityId', cityId);
         }
 
         const data = await api.get(`/events?${params.toString()}`);
@@ -78,7 +137,7 @@ export default function EventsPage() {
     }
 
     fetchEvents();
-  }, [category, city, authLoading]);
+  }, [category, cityId, authLoading]);
 
   return (
     <div className="page-container py-8 animate-fade-in">
@@ -112,14 +171,21 @@ export default function EventsPage() {
           ))}
         </div>
 
-        {/* City search input */}
-        <input
-          type="text"
+        {/* City filter dropdown. 'all' shows events in every city;
+            defaults to the logged-in customer's own city (see the
+            effect above), and the customer is free to change it. */}
+        <select
           className="input max-w-xs"
-          placeholder="🔍 Search by city..."
-          value={city}
-          onChange={(e) => setCity(e.target.value)}
-        />
+          value={cityId}
+          onChange={(e) => setCityId(e.target.value)}
+        >
+          <option value="all">All Cities</option>
+          {cities.map((c) => (
+            <option key={c.city_id} value={c.city_id}>
+              {c.city_name}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* ---- Loading State ---- */}
@@ -143,8 +209,8 @@ export default function EventsPage() {
           <div className="text-5xl mb-4">🎪</div>
           <h3 className="text-xl font-semibold mb-2">No events found</h3>
           <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-            {category !== 'All' || city
-              ? 'Try adjusting your filters or search terms.'
+            {category !== 'All' || cityId !== 'all'
+              ? 'Try adjusting your filters.'
               : 'No published events yet. Check back soon!'}
           </p>
         </div>

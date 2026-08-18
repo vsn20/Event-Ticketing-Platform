@@ -50,8 +50,8 @@ const pool = require('../config/db');
 // creating events under someone else's account.
 // ============================================================
 async function createEvent({ orgId, venueId, name, description, category,
-                             startTime, endTime, saleWindowStart, saleWindowEnd,
-                             bufferHoursBefore = 2, bufferHoursAfter = 2 }) {
+  startTime, endTime, saleWindowStart, saleWindowEnd,
+  bufferHoursBefore = 2, bufferHoursAfter = 2 }) {
   // ----------------------------------------------------------
   // Step 1: Verify the venue exists.
   // ----------------------------------------------------------
@@ -120,7 +120,7 @@ async function createEvent({ orgId, venueId, name, description, category,
                event_start_time, event_end_time, status,
                sale_window_start, sale_window_end, created_at`,
     [orgId, venueId, name, description || null, category || null,
-     startTime, endTime, saleWindowStart || null, saleWindowEnd || null]
+      startTime, endTime, saleWindowStart || null, saleWindowEnd || null]
   );
 
   return result.rows[0];
@@ -132,13 +132,27 @@ async function createEvent({ orgId, venueId, name, description, category,
 // ============================================================
 // Returns a list of events, optionally filtered by:
 //   - status: only show events in a specific status
-//   - city: only show events at venues in a specific city
+//   - cityId: only show events at venues in a specific city
 //   - category: only show events in a specific category
 //   - orgId: only show events created by a specific organizer
 //
-// The query JOINs with the venues table to include venue name
-// and city in the response — this saves the frontend from
-// making a separate API call for each event's venue.
+// The query JOINs with venues AND cities to include venue name
+// and city name in the response — this saves the frontend from
+// making separate API calls just to display where each event is.
+//
+// `cityId` FILTERING (was previously free-text `city`):
+//   Because venues now store city_id (a foreign key, see
+//   migration 003) instead of a free-text city string, filtering
+//   is now an exact integer match (`v.city_id = $1`) instead of
+//   a fuzzy ILIKE '%text%' match. This is both faster (integer
+//   equality uses the index cleanly; ILIKE with a leading
+//   wildcard cannot) and more correct (no more "Bangalore" vs
+//   "bangalore" vs "Bengaluru" mismatches).
+//
+//   `cityId` also accepts the literal string "all" (or is simply
+//   omitted) to mean "don't filter by city at all" — this is
+//   what powers the "All" option in the customer dashboard's
+//   city filter dropdown, alongside each individual city.
 //
 // Results are ordered by event_start_time ascending (soonest
 // events first) — this is the natural ordering customers
@@ -165,10 +179,11 @@ async function getAllEvents(filters = {}) {
     paramIndex++;
   }
 
-  // Filter by venue city (e.g., 'Bangalore')
-  if (filters.city) {
-    conditions.push(`v.city ILIKE $${paramIndex}`);
-    values.push(`%${filters.city}%`);
+  // Filter by venue city_id. "all" (or omitting the filter
+  // entirely) means no city filtering — every city is included.
+  if (filters.cityId && filters.cityId !== 'all') {
+    conditions.push(`v.city_id = $${paramIndex}`);
+    values.push(filters.cityId);
     paramIndex++;
   }
 
@@ -191,9 +206,11 @@ async function getAllEvents(filters = {}) {
             e.event_start_time, e.event_end_time, e.status,
             e.sale_window_start, e.sale_window_end,
             e.created_at, e.updated_at,
-            v.venue_id, v.venue_name, v.city
+            v.venue_id, v.venue_name,
+            c.city_id, c.city_name
      FROM events e
      JOIN venues v ON e.venue_id = v.venue_id
+     JOIN cities c ON c.city_id = v.city_id
      WHERE ${conditions.join(' AND ')}
      ORDER BY e.event_start_time ASC`,
     values
@@ -218,19 +235,25 @@ async function getAllEvents(filters = {}) {
 // ============================================================
 async function getEventById(eventId) {
   // ----------------------------------------------------------
-  // Main query: JOIN events with venues and organizers to get
-  // everything in one round-trip.
+  // Main query: JOIN events with venues, cities, and organizers
+  // to get everything in one round-trip.
+  //
+  // The extra JOIN to `cities` replaces the old `v.city` free-
+  // text column (removed in migration 003) — venues now store
+  // city_id, so we resolve the readable city name/state here.
   // ----------------------------------------------------------
   const result = await pool.query(
     `SELECT e.event_id, e.event_name, e.description, e.category,
             e.event_start_time, e.event_end_time, e.status,
             e.sale_window_start, e.sale_window_end,
             e.created_at, e.updated_at,
-            v.venue_id, v.venue_name, v.address, v.city, v.total_capacity,
+            v.venue_id, v.venue_name, v.address, v.total_capacity,
             v.seat_layout_json,
+            c.city_id, c.city_name, c.state,
             o.org_id, o.org_name
      FROM events e
      JOIN venues v ON e.venue_id = v.venue_id
+     JOIN cities c ON c.city_id = v.city_id
      JOIN organizers o ON e.org_id = o.org_id
      WHERE e.event_id = $1`,
     [eventId]

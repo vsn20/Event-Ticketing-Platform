@@ -38,22 +38,32 @@ const {
 //   {
 //     "name": "Vishal",
 //     "email": "vishal@example.com",
-//     "phone": "9876543210",        ← optional
+//     "phone": "9876543210",   ← optional
 //     "password": "securePassword",
-//     "defaultLocation": "Bangalore" ← optional, pre-fills event search
+//     "defaultCityId": 1       ← required, from GET /api/cities dropdown
 //   }
 //
+// `defaultCityId` replaces the old free-text `defaultLocation`.
+// It's required (not optional) because the design decision was:
+// "by default filtering should be based on the address" — that
+// only works if every customer actually has a city on record.
+// The frontend fetches GET /api/cities to render the dropdown
+// and sends back the chosen city's ID.
+//
 // Returns:
-//   201 → { token, user: { id, name, email, role, createdAt } }
-//   400 → { error: "..." } if validation fails or email taken
+//   201 → { token, user: { id, name, email, role, defaultCityId,
+//                           defaultCityName, createdAt } }
+//   400 → { error: "..." } if validation fails or cityId invalid
+//   409 → { error: "..." } if email already taken
 // ============================================================
 async function customerSignup(req, res) {
-  const { name, email, password, phone, defaultLocation } = req.body;
+  const { name, email, password, phone, defaultCityId } = req.body;
 
   // ----------------------------------------------------------
   // Input validation — catch missing fields here in the
   // controller, before the service layer tries to run SQL
   // with null values and produces a confusing database error.
+  // defaultCityId is now required, same as name/email/password.
   // ----------------------------------------------------------
   if (!name || !email || !password) {
     return res.status(400).json({
@@ -61,8 +71,14 @@ async function customerSignup(req, res) {
     });
   }
 
+  if (!defaultCityId) {
+    return res.status(400).json({
+      error: 'Missing required field: "defaultCityId" is required. Fetch GET /api/cities to get valid options.',
+    });
+  }
+
   try {
-    const result = await signupCustomer({ name, email, phone, password, defaultLocation });
+    const result = await signupCustomer({ name, email, phone, password, defaultCityId });
 
     // 201 Created — the standard HTTP status for "a new
     // resource was successfully created."
@@ -75,6 +91,15 @@ async function customerSignup(req, res) {
     if (err.code === '23505') {
       return res.status(409).json({
         error: 'An account with this email already exists.',
+      });
+    }
+
+    // Foreign key violation (code 23503) means defaultCityId
+    // doesn't match any real row in the cities table — e.g. a
+    // stale or tampered ID from the frontend.
+    if (err.code === '23503') {
+      return res.status(400).json({
+        error: 'Invalid defaultCityId — that city does not exist. Fetch GET /api/cities to get valid options.',
       });
     }
 

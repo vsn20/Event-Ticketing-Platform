@@ -37,10 +37,18 @@ export default function CreateEventPage() {
   const [venues, setVenues] = useState([]);
   const [selectedVenueId, setSelectedVenueId] = useState('');
 
-  // New venue form fields
+  // Cities dropdown data — used both to show each existing venue's
+  // city in the "select" list, and to populate the city dropdown
+  // in the "create new venue" form below.
+  const [cities, setCities] = useState([]);
+
+  // New venue form fields.
+  // venueCityId replaces the old free-text venueCity — it's the
+  // selected <option> value from a dropdown fed by GET /api/cities
+  // (fetched below), matching the backend's city_id foreign key.
   const [venueName, setVenueName] = useState('');
   const [venueAddress, setVenueAddress] = useState('');
-  const [venueCity, setVenueCity] = useState('');
+  const [venueCityId, setVenueCityId] = useState('');
   const [venueSections, setVenueSections] = useState([
     // Start with one section by default. The organizer can add more.
     { name: 'General', rows: 'A,B,C', seatsPerRow: 20, defaultPrice: 50 },
@@ -97,6 +105,27 @@ export default function CreateEventPage() {
   }, [authLoading, user]);
 
   // ----------------------------------------------------------
+  // Fetch the list of cities for the venue-creation dropdown.
+  // Public endpoint, but we still wait for auth to settle first
+  // just to keep this effect's timing consistent with the others
+  // on this page.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (authLoading || !user) return;
+
+    async function fetchCities() {
+      try {
+        const data = await api.get('/cities');
+        setCities(data);
+      } catch (err) {
+        console.error('Failed to load cities:', err);
+      }
+    }
+
+    fetchCities();
+  }, [authLoading, user]);
+
+  // ----------------------------------------------------------
   // addSection — adds a new empty section to the venue form
   // ----------------------------------------------------------
   function addSection() {
@@ -147,10 +176,13 @@ export default function CreateEventPage() {
           })),
         };
 
+        // cityId is required by the backend (see venueController.js
+        // validation) — there's no "undefined" fallback here the
+        // way there is for the optional address field.
         const venueData = await api.post('/venues', {
           name: venueName,
           address: venueAddress || undefined,
-          city: venueCity || undefined,
+          cityId: venueCityId,
           seatLayoutJson: seatLayoutJson,
         });
 
@@ -205,7 +237,7 @@ export default function CreateEventPage() {
 
           {/* Toggle between select/create */}
           <div className="flex rounded-lg overflow-hidden mb-5"
-               style={{ border: '1px solid var(--border-color)' }}>
+            style={{ border: '1px solid var(--border-color)' }}>
             <button type="button"
               onClick={() => setVenueMode('select')}
               className="flex-1 py-2.5 text-sm font-medium transition-all"
@@ -247,7 +279,9 @@ export default function CreateEventPage() {
                     <option value="">Choose a venue...</option>
                     {venues.map((v) => (
                       <option key={v.venue_id} value={v.venue_id}>
-                        {v.venue_name} — {v.city || 'No city'} ({v.total_capacity || '?'} seats)
+                        {/* v.city_name comes from the backend's JOIN
+                            to the cities table (see venueService.js) */}
+                        {v.venue_name} — {v.city_name || 'No city'} ({v.total_capacity || '?'} seats)
                       </option>
                     ))}
                   </select>
@@ -271,9 +305,19 @@ export default function CreateEventPage() {
                     value={venueAddress} onChange={(e) => setVenueAddress(e.target.value)} />
                 </div>
                 <div>
-                  <label className="label">City <span style={{ color: 'var(--text-muted)' }}>(optional)</span></label>
-                  <input type="text" className="input" placeholder="Bangalore"
-                    value={venueCity} onChange={(e) => setVenueCity(e.target.value)} />
+                  <label className="label">City</label>
+                  {/* Required dropdown, not free text — matches the
+                      backend's city_id foreign key (migration 003).
+                      Options come from GET /api/cities, fetched above. */}
+                  <select className="input" value={venueCityId}
+                    onChange={(e) => setVenueCityId(e.target.value)} required>
+                    <option value="" disabled>Select a city</option>
+                    {cities.map((c) => (
+                      <option key={c.city_id} value={c.city_id}>
+                        {c.city_name}{c.state ? `, ${c.state}` : ''}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
@@ -290,7 +334,7 @@ export default function CreateEventPage() {
 
                 {venueSections.map((section, i) => (
                   <div key={i} className="p-4 rounded-lg mb-3"
-                       style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
+                    style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
                     <div className="flex items-center justify-between mb-3">
                       <span className="text-sm font-medium">Section {i + 1}</span>
                       {venueSections.length > 1 && (

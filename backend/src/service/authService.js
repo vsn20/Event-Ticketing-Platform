@@ -37,21 +37,32 @@ const SALT_ROUNDS = 10;
 
 
 // ============================================================
-// signupCustomer({ name, email, phone, password, defaultLocation })
+// signupCustomer({ name, email, phone, password, defaultCityId })
 // ============================================================
 // Creates a new customer account.
+//
+// `defaultCityId` replaces the old free-text `defaultLocation`
+// field — it's a foreign key into the `cities` table (see
+// migration 003), selected from the same dropdown used on the
+// venue-creation and event-filter screens. This is the city the
+// event listing will default to filtering by when this customer
+// logs in.
 //
 // Steps:
 //   1. Hash the password with bcrypt (never store plaintext)
 //   2. INSERT into the customers table
 //   3. Generate a JWT with the customer's ID and role
-//   4. Return the token and basic user info
+//   4. Return the token and basic user info (including their
+//      chosen city, joined from the cities table)
 //
 // If the email already exists, Postgres will reject the INSERT
 // because customer_email has a UNIQUE constraint — we catch
-// that and return a clear error message.
+// that and return a clear error message. Similarly, if
+// defaultCityId doesn't correspond to a real city, the foreign
+// key constraint rejects the INSERT — see authController.js for
+// how that's translated into a user-facing message.
 // ============================================================
-async function signupCustomer({ name, email, phone, password, defaultLocation }) {
+async function signupCustomer({ name, email, phone, password, defaultCityId }) {
   // Step 1: Hash the password before storing it.
   // bcrypt.hash() generates a random salt internally and
   // combines it with the hash, so two identical passwords
@@ -59,14 +70,20 @@ async function signupCustomer({ name, email, phone, password, defaultLocation })
   // table attacks.
   const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
-  // Step 2: Insert the new customer.
-  // RETURNING gives us the auto-generated customer_id and
-  // created_at without needing a separate SELECT query.
+  // Step 2: Insert the new customer, then join back to `cities`
+  // in the same round-trip (via a CTE) so the response can
+  // include the readable city name immediately — same pattern
+  // used in venueService.createVenue for the same reason.
   const result = await pool.query(
-    `INSERT INTO customers (customer_name, customer_email, phone_number, password_hash, default_location)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING customer_id, customer_name, customer_email, created_at`,
-    [name, email, phone || null, passwordHash, defaultLocation || null]
+    `WITH inserted AS (
+       INSERT INTO customers (customer_name, customer_email, phone_number, password_hash, default_city_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING customer_id, customer_name, customer_email, default_city_id, created_at
+     )
+     SELECT inserted.*, c.city_name, c.state
+     FROM inserted
+     LEFT JOIN cities c ON c.city_id = inserted.default_city_id`,
+    [name, email, phone || null, passwordHash, defaultCityId || null]
   );
 
   const customer = result.rows[0];
@@ -92,6 +109,8 @@ async function signupCustomer({ name, email, phone, password, defaultLocation })
       name: customer.customer_name,
       email: customer.customer_email,
       role: 'customer',
+      defaultCityId: customer.default_city_id,
+      defaultCityName: customer.city_name,
       createdAt: customer.created_at,
     },
   };
@@ -156,10 +175,17 @@ async function signupOrganizer({ name, email, phone, password }) {
 // ============================================================
 async function loginCustomer({ email, password }) {
   // Step 1: Find the customer by email.
+  // Joins to `cities` so the login response includes the
+  // customer's default city name — the frontend needs this
+  // immediately on login to pre-filter the event listing
+  // (see "Stage 1" of the design doc: default filter = user's
+  // home city), without a second API call just to resolve the ID.
   const result = await pool.query(
-    `SELECT customer_id, customer_name, customer_email, password_hash
-     FROM customers
-     WHERE customer_email = $1`,
+    `SELECT cu.customer_id, cu.customer_name, cu.customer_email, cu.password_hash,
+            cu.default_city_id, ci.city_name AS default_city_name
+     FROM customers cu
+     LEFT JOIN cities ci ON ci.city_id = cu.default_city_id
+     WHERE cu.customer_email = $1`,
     [email]
   );
 
@@ -196,6 +222,8 @@ async function loginCustomer({ email, password }) {
       name: customer.customer_name,
       email: customer.customer_email,
       role: 'customer',
+      defaultCityId: customer.default_city_id,
+      defaultCityName: customer.default_city_name,
     },
   };
 }

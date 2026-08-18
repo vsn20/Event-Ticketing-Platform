@@ -16,6 +16,7 @@
 //   /health             → liveness check
 //   /health/db          → database connectivity check
 //   /api/auth/...       → signup and login for customers & organizers
+//   /api/cities/...     → city lookup list (for dropdowns)
 //   /api/venues/...     → venue CRUD (create, list, get)
 //   /api/events/...     → event CRUD, publish, pricing
 // ============================================================
@@ -82,6 +83,11 @@ app.get('/health/db', async (req, res) => {
 // No authentication required on these (you can't be logged in
 // before you've signed up).
 app.use('/api/auth', require('./src/routes/authRoutes'));
+
+// City routes — lookup list for dropdowns (venue creation,
+// customer signup, event listing filter). Public, no auth
+// required — the signup page needs this before a token exists.
+app.use('/api/cities', require('./src/routes/cityRoutes'));
 
 // Venue routes — create, list, and view venues.
 // Creating requires organizer role; viewing is any authenticated user.

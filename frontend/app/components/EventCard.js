@@ -68,7 +68,7 @@ export default function EventCard({ event }) {
       <div className="flex items-center justify-between mb-3">
         {event.category && (
           <span className="text-xs font-medium px-2.5 py-1 rounded-full"
-                style={{ background: 'var(--color-primary-light)', color: 'var(--color-primary)' }}>
+            style={{ background: 'var(--color-primary-light)', color: 'var(--color-primary)' }}>
             {event.category}
           </span>
         )}
@@ -84,14 +84,17 @@ export default function EventCard({ event }) {
 
       {/* ---- Venue + City ---- */}
       <div className="flex items-center gap-1.5 mb-1.5 text-sm"
-           style={{ color: 'var(--text-secondary)' }}>
+        style={{ color: 'var(--text-secondary)' }}>
         <span>📍</span>
-        <span>{event.venue_name}{event.city ? `, ${event.city}` : ''}</span>
+        {/* event.city_name comes from the backend's JOIN to the
+            cities table (see eventService.getAllEvents) — the
+            old event.city free-text field no longer exists. */}
+        <span>{event.venue_name}{event.city_name ? `, ${event.city_name}` : ''}</span>
       </div>
 
       {/* ---- Date/Time ---- */}
       <div className="flex items-center gap-1.5 text-sm"
-           style={{ color: 'var(--text-secondary)' }}>
+        style={{ color: 'var(--text-secondary)' }}>
         <span>📅</span>
         <span>{formatDate(event.event_start_time)}</span>
       </div>
@@ -99,7 +102,7 @@ export default function EventCard({ event }) {
       {/* ---- Description preview (truncated) ---- */}
       {event.description && (
         <p className="mt-3 text-sm line-clamp-2"
-           style={{ color: 'var(--text-muted)' }}>
+          style={{ color: 'var(--text-muted)' }}>
           {event.description}
         </p>
       )}

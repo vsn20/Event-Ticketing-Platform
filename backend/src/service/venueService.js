@@ -23,9 +23,17 @@ const pool = require('../config/db');
 
 
 // ============================================================
-// createVenue({ name, address, city, totalCapacity, seatLayoutJson })
+// createVenue({ name, address, cityId, totalCapacity, seatLayoutJson })
 // ============================================================
 // Creates a new venue record.
+//
+// `cityId` replaces the old free-text `city` field — it's a
+// foreign key into the `cities` table (see migration 003), so
+// the organizer picks a city from a dropdown on the frontend
+// instead of typing it. Postgres will reject the INSERT with a
+// foreign key violation if an invalid cityId is passed, which
+// is exactly the safety net we want: it's impossible to create
+// a venue in a city that doesn't exist in our system.
 //
 // The seatLayoutJson should follow this structure:
 //   {
@@ -51,7 +59,7 @@ const pool = require('../config/db');
 // count seats AND prevents mismatches between the layout and
 // the stated capacity.
 // ============================================================
-async function createVenue({ name, address, city, totalCapacity, seatLayoutJson }) {
+async function createVenue({ name, address, cityId, totalCapacity, seatLayoutJson }) {
   // ----------------------------------------------------------
   // Auto-calculate total capacity from the layout if the
   // organizer didn't provide it. This way the capacity is
@@ -65,11 +73,29 @@ async function createVenue({ name, address, city, totalCapacity, seatLayoutJson 
     }, 0);
   }
 
+  // ----------------------------------------------------------
+  // Insert the venue, then immediately JOIN back to `cities` in
+  // the RETURNING step so the response includes the readable
+  // city name/state, not just the raw city_id. This saves the
+  // frontend a second round-trip just to display "Bangalore"
+  // instead of "3" right after creating the venue.
+  //
+  // Postgres doesn't support joining inside a plain RETURNING
+  // clause, so this is done as an INSERT ... RETURNING venue_id,
+  // followed by a second SELECT that joins cities. Wrapped in a
+  // single query via a CTE (WITH ... AS) keeps it to one
+  // round-trip to the database instead of two separate queries.
+  // ----------------------------------------------------------
   const result = await pool.query(
-    `INSERT INTO venues (venue_name, address, city, total_capacity, seat_layout_json)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING venue_id, venue_name, address, city, total_capacity, seat_layout_json, created_at`,
-    [name, address || null, city || null, capacity || null, seatLayoutJson || null]
+    `WITH inserted AS (
+       INSERT INTO venues (venue_name, address, city_id, total_capacity, seat_layout_json)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING venue_id, venue_name, address, city_id, total_capacity, seat_layout_json, created_at
+     )
+     SELECT inserted.*, c.city_name, c.state
+     FROM inserted
+     JOIN cities c ON c.city_id = inserted.city_id`,
+    [name, address || null, cityId || null, capacity || null, seatLayoutJson || null]
   );
 
   return result.rows[0];
@@ -85,12 +111,20 @@ async function createVenue({ name, address, city, totalCapacity, seatLayoutJson 
 // to pick a venue from a dropdown. We return basic info plus
 // the seat layout so the frontend can preview the venue's
 // sections before the organizer commits.
+//
+// JOINs to `cities` so the response includes a readable
+// city_name/state instead of just the raw city_id — the
+// frontend shouldn't have to separately fetch /api/cities and
+// manually match IDs just to display where each venue is.
 // ============================================================
 async function getAllVenues() {
   const result = await pool.query(
-    `SELECT venue_id, venue_name, address, city, total_capacity, seat_layout_json, created_at
-     FROM venues
-     ORDER BY created_at DESC`
+    `SELECT v.venue_id, v.venue_name, v.address, v.total_capacity,
+            v.seat_layout_json, v.created_at,
+            c.city_id, c.city_name, c.state
+     FROM venues v
+     JOIN cities c ON c.city_id = v.city_id
+     ORDER BY v.created_at DESC`
   );
 
   return result.rows;
@@ -109,9 +143,12 @@ async function getAllVenues() {
 // ============================================================
 async function getVenueById(venueId) {
   const result = await pool.query(
-    `SELECT venue_id, venue_name, address, city, total_capacity, seat_layout_json, created_at
-     FROM venues
-     WHERE venue_id = $1`,
+    `SELECT v.venue_id, v.venue_name, v.address, v.total_capacity,
+            v.seat_layout_json, v.created_at,
+            c.city_id, c.city_name, c.state
+     FROM venues v
+     JOIN cities c ON c.city_id = v.city_id
+     WHERE v.venue_id = $1`,
     [venueId]
   );
 

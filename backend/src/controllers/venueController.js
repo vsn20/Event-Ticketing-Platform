@@ -24,8 +24,8 @@ const { createVenue, getAllVenues, getVenueById } = require('../service/venueSer
 // Expected request body:
 //   {
 //     "name": "Bangalore Indoor Stadium",
-//     "address": "Kanteerava Complex, Bangalore",
-//     "city": "Bangalore",
+//     "address": "Kanteerava Complex",
+//     "cityId": 1,                      ← required, from the /api/cities dropdown
 //     "totalCapacity": 500,             ← optional (auto-calculated from layout)
 //     "seatLayoutJson": {
 //       "sections": [
@@ -35,21 +35,33 @@ const { createVenue, getAllVenues, getVenueById } = require('../service/venueSer
 //     }
 //   }
 //
+// NOTE: `cityId` replaces the old free-text `city` field. The
+// frontend fetches GET /api/cities to populate a dropdown, and
+// sends back the selected city's ID — the organizer never types
+// a city name by hand anymore.
+//
 // Returns:
 //   201 → the created venue object
 //   400 → validation error
 // ============================================================
 async function createVenueHandler(req, res) {
-  const { name, address, city, totalCapacity, seatLayoutJson } = req.body;
+  const { name, address, cityId, totalCapacity, seatLayoutJson } = req.body;
 
   // ----------------------------------------------------------
-  // Validation: venue must have a name and a seat layout.
-  // Without a layout, there's nothing to generate seats from
-  // when events are published at this venue.
+  // Validation: venue must have a name, a city, and a seat
+  // layout. cityId is required (not optional like address) —
+  // every venue needs to belong to a real city so that
+  // location-based filtering works correctly downstream.
   // ----------------------------------------------------------
   if (!name) {
     return res.status(400).json({
       error: 'Missing required field: "name" is required.',
+    });
+  }
+
+  if (!cityId) {
+    return res.status(400).json({
+      error: 'Missing required field: "cityId" is required. Fetch GET /api/cities to get valid options.',
     });
   }
 
@@ -84,9 +96,19 @@ async function createVenueHandler(req, res) {
   }
 
   try {
-    const venue = await createVenue({ name, address, city, totalCapacity, seatLayoutJson });
+    const venue = await createVenue({ name, address, cityId, totalCapacity, seatLayoutJson });
     res.status(201).json(venue);
   } catch (err) {
+    // Postgres foreign key violation (code 23503) means the
+    // cityId sent doesn't actually exist in the cities table —
+    // e.g. the frontend sent a stale/tampered ID. Translate this
+    // into a clear message instead of a raw database error.
+    if (err.code === '23503') {
+      return res.status(400).json({
+        error: 'Invalid cityId — that city does not exist. Fetch GET /api/cities to get valid options.',
+      });
+    }
+
     console.error('Failed to create venue:', err);
     res.status(400).json({ error: err.message });
   }

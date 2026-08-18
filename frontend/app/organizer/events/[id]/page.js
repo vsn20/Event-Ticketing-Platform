@@ -327,7 +327,10 @@ export default function ManageEventPage() {
             </div>
             <div>
               <span style={{ color: 'var(--text-muted)' }}>City:</span>{' '}
-              <span className="font-medium">{event.city || '—'}</span>
+              {/* event.city_name comes from the backend's JOIN to
+                  the cities table — the old free-text event.city
+                  field no longer exists (see migration 003). */}
+              <span className="font-medium">{event.city_name || '—'}</span>
             </div>
             <div>
               <span style={{ color: 'var(--text-muted)' }}>Starts:</span>{' '}
