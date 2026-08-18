@@ -57,10 +57,17 @@ function getStatusBadge(status) {
   return map[status] || 'badge badge-draft';
 }
 
-export default function EventCard({ event }) {
+export default function EventCard({ event, cityId }) {
+  // Build the detail URL. If we know the city the user is browsing,
+  // carry it as ?cityId so the detail page can put it in its
+  // "Back to Events" link — returning the user to the right filter.
+  const href = cityId && cityId !== 'all'
+    ? `/events/${event.event_id}?cityId=${cityId}`
+    : `/events/${event.event_id}`;
+
   return (
     <Link
-      href={`/events/${event.event_id}`}
+      href={href}
       className="card p-5 block no-underline"
       style={{ color: 'inherit' }}
     >

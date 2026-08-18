@@ -24,7 +24,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
@@ -62,10 +62,14 @@ function getStatusBadge(status) {
 }
 
 export default function EventDetailPage() {
-  // useParams() reads the [id] from the URL.
-  // For /events/5, this gives us { id: '5' }.
   const params = useParams();
+  const searchParams = useSearchParams();
   const { loading: authLoading } = useAuth();
+
+  // Build the back-link URL carrying the cityId the user was browsing,
+  // so clicking "Back to Events" returns them to the same city filter.
+  const cityId = searchParams.get('cityId');
+  const backHref = cityId ? `/events?cityId=${cityId}` : '/events';
 
   const [event, setEvent] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -111,7 +115,7 @@ export default function EventDetailPage() {
           <div className="text-5xl mb-4">😕</div>
           <h2 className="text-xl font-semibold mb-2">Event not found</h2>
           <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>{error}</p>
-          <Link href="/events" className="btn-primary no-underline">
+          <Link href={backHref} className="btn-primary no-underline">
             Back to Events
           </Link>
         </div>
@@ -126,7 +130,7 @@ export default function EventDetailPage() {
     <div className="page-container py-8 animate-fade-in">
 
       {/* ---- Back link ---- */}
-      <Link href="/events" className="text-sm no-underline mb-6 inline-block"
+      <Link href={backHref} className="text-sm no-underline mb-6 inline-block"
             style={{ color: 'var(--text-secondary)' }}>
         ← Back to Events
       </Link>

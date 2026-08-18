@@ -1,69 +1,70 @@
 // ============================================================
 // Events Listing Page — /events
 //
-// The main browsing page for customers. Shows all published
-// events in a grid of EventCard components.
+// Browsing page for customers showing all published events.
 //
-// Features:
-//   - Fetches events from GET /api/events on page load
-//   - Filter buttons for category (Music, Sports, Conference, etc.)
-//   - City filter DROPDOWN (fed by GET /api/cities), defaulting
-//     to the logged-in customer's own default city
-//   - Shows loading state while fetching
-//   - Shows empty state if no events match the filters
+// CITY FILTER APPROACH — URL query params:
+//   The selected city is stored in the URL as ?cityId=3
+//   So /events?cityId=3 shows Delhi events.
+//   When you click an event, the detail page's "Back to Events"
+//   link carries ?cityId=3 back, so you land exactly where
+//   you left off — no storage API needed.
 //
-// API called: GET /api/events?status=published&cityId=X&category=Y
+//   On first visit (no ?cityId in URL), the logged-in customer's
+//   signup city is applied automatically by replacing the URL.
 //
-// CITY FILTER DEFAULT BEHAVIOR:
-//   The first time this page loads for a logged-in customer, the
-//   city dropdown is pre-set to `user.defaultCityId` (the city
-//   they picked at signup, returned on every login). This is what
-//   "by default filtering should be based on the address" means
-//   in practice — the customer sees events near them immediately,
-//   without touching any filter. They can then freely change the
-//   dropdown to "All" or any other city for that session; we
-//   don't overwrite their choice again once they've changed it.
+// API: GET /api/events?status=published&cityId=X&category=Y
 // ============================================================
 
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
 import EventCard from '@/app/components/EventCard';
 
-// Predefined categories for the filter buttons.
-// These match what organizers can set when creating events.
 const CATEGORIES = ['All', 'Music', 'Sports', 'Conference', 'Comedy', 'Theatre', 'Festival'];
 
-export default function EventsPage() {
+// Wrap in Suspense because useSearchParams() requires it in Next.js 16
+export default function EventsPageWrapper() {
+  return (
+    <Suspense fallback={
+      <div className="page-container py-8">
+        <div className="flex items-center justify-center py-20">
+          <div className="spinner" style={{ width: 40, height: 40 }}></div>
+        </div>
+      </div>
+    }>
+      <EventsPage />
+    </Suspense>
+  );
+}
+
+function EventsPage() {
   const { user, loading: authLoading } = useAuth();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Read city from URL — this is the single source of truth.
+  // 'all' means no city filter.
+  const cityIdFromUrl = searchParams.get('cityId') || 'all';
+
+  // Category stays in local state (not in URL — keeps URL clean)
+  const [category, setCategory] = useState('All');
 
   // Data state
   const [events, setEvents] = useState([]);
-
-  // City dropdown data — fetched once from the public /api/cities
-  // endpoint, same as the signup page.
   const [cities, setCities] = useState([]);
-
-  // Filter state.
-  // cityId starts as 'all' (no filter) until we know the logged-in
-  // customer's default city — see the effect below that sets it
-  // the FIRST time `user` becomes available.
-  const [category, setCategory] = useState('All');
-  const [cityId, setCityId] = useState('all');
-
-  // Tracks whether we've already applied the customer's default
-  // city once, so we don't keep resetting their manual dropdown
-  // choice back to their home city on every re-render.
-  const didApplyDefaultCity = useRef(false);
-
-  // UI state
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  // Tracks whether we've already applied the user's default city
+  // to the URL on this mount (so we don't loop).
+  const didApplyDefaultCity = useRef(false);
+
   // ----------------------------------------------------------
-  // Fetch the city dropdown options once on mount.
+  // Fetch city dropdown options once on mount.
   // ----------------------------------------------------------
   useEffect(() => {
     async function fetchCities() {
@@ -71,67 +72,38 @@ export default function EventsPage() {
         const data = await api.get('/cities');
         setCities(data);
       } catch {
-        // Non-fatal — the "All" option and category filters still work
-        // even if the city dropdown fails to load.
+        // Non-fatal — filters still work without this
       }
     }
-
     fetchCities();
   }, []);
 
   // ----------------------------------------------------------
-  // Apply the logged-in customer's default city to the filter,
-  // but ONLY ONCE — the first time `user` becomes available after
-  // auth finishes loading. Using a ref (didApplyDefaultCity)
-  // instead of a plain state check prevents this from firing
-  // again and clobbering the dropdown if the customer manually
-  // switches to a different city afterward.
+  // Apply logged-in customer's default city to the URL,
+  // but ONLY if there is no ?cityId already in the URL.
+  // This way: first visit → default city; returning visit
+  // from an event page → URL already has ?cityId → skip.
   // ----------------------------------------------------------
   useEffect(() => {
     if (authLoading) return;
+    if (didApplyDefaultCity.current) return;
+    didApplyDefaultCity.current = true;
 
-    if (user?.defaultCityId && !didApplyDefaultCity.current) {
-      setCityId(String(user.defaultCityId));
-      didApplyDefaultCity.current = true;
+    // Only redirect if the URL has no cityId yet AND the user
+    // has a default city set (from signup).
+    if (cityIdFromUrl === 'all' && user?.defaultCityId) {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set('cityId', String(user.defaultCityId));
+      router.replace(`/events?${params.toString()}`);
     }
-  }, [user, authLoading]);
+  }, [authLoading, user]);
 
   // ----------------------------------------------------------
-  // Fetch events whenever filters change.
-  //
-  // useEffect runs after every render where [category, cityId,
-  // authLoading] changed. The authLoading check ensures we don't
-  // fire the API call before the auth token is loaded from
-  // localStorage (which would result in a 401 error).
-  //
-  // RACE CONDITION GUARD:
-  //   AuthContext sets `user` and flips `authLoading` to false in
-  //   the SAME effect/commit. That means on the render where the
-  //   customer's session is restored, TWO effects fire back to
-  //   back: the "apply default city" effect (which calls
-  //   setCityId(...) but doesn't take effect until the next
-  //   render) and this fetch effect (which still closes over the
-  //   OLD cityId, 'all', because state hasn't updated yet).
-  //
-  //   Concretely, right after login/refresh this fires:
-  //     Request A: GET /events                (cityId still 'all')
-  //     Request B: GET /events?cityId=<home>  (after cityId updates)
-  //   two requests in flight for the same effect key. Without a
-  //   guard, whichever response arrives LAST wins — and since the
-  //   unfiltered request (A) usually returns more rows, it can
-  //   easily resolve after the filtered one (B) and silently
-  //   overwrite it. That's the bug: the dropdown shows the
-  //   customer's home city, but the grid shows unfiltered events.
-  //
-  //   The fix is the standard React pattern: each effect run gets
-  //   its own `ignore` flag via the cleanup function. If a newer
-  //   effect run has started before an older request resolves, the
-  //   older run's `ignore` is set to true in its cleanup, and its
-  //   setEvents/setError/setLoading calls are skipped. Only the
-  //   response belonging to the LATEST filters is ever applied.
+  // Fetch events whenever URL cityId or category changes.
+  // Race condition guarded with an `ignore` flag.
   // ----------------------------------------------------------
   useEffect(() => {
-    if (authLoading) return; // Wait for auth to initialize
+    if (authLoading) return;
 
     let ignore = false;
 
@@ -140,28 +112,13 @@ export default function EventsPage() {
       setError('');
 
       try {
-        // Build query string from active filters.
-        // We always filter to published/live events for customers.
         const params = new URLSearchParams();
         params.set('status', 'published');
-
-        if (category !== 'All') {
-          params.set('category', category);
-        }
-
-        // 'all' means "don't filter by city" — we simply omit the
-        // param, same effect as the backend's explicit "all" handling.
-        if (cityId && cityId !== 'all') {
-          params.set('cityId', cityId);
-        }
+        if (category !== 'All') params.set('category', category);
+        if (cityIdFromUrl && cityIdFromUrl !== 'all') params.set('cityId', cityIdFromUrl);
 
         const data = await api.get(`/events?${params.toString()}`);
-
-        // A newer effect run (e.g. cityId changed again since this
-        // request was fired) has already superseded this one —
-        // discard this stale response instead of applying it.
         if (ignore) return;
-
         setEvents(data);
       } catch (err) {
         if (ignore) return;
@@ -172,14 +129,22 @@ export default function EventsPage() {
     }
 
     fetchEvents();
+    return () => { ignore = true; };
+  }, [category, cityIdFromUrl, authLoading]);
 
-    // Cleanup runs before the next effect execution (or on unmount).
-    // Marks this run's in-flight request as stale so its result is
-    // ignored if it resolves after a newer request has started.
-    return () => {
-      ignore = true;
-    };
-  }, [category, cityId, authLoading]);
+  // ----------------------------------------------------------
+  // When user picks a city from the dropdown, update the URL.
+  // The URL change automatically re-triggers the fetch effect.
+  // ----------------------------------------------------------
+  function handleCityChange(val) {
+    const params = new URLSearchParams(searchParams.toString());
+    if (val === 'all') {
+      params.delete('cityId');
+    } else {
+      params.set('cityId', val);
+    }
+    router.replace(`/events?${params.toString()}`);
+  }
 
   return (
     <div className="page-container py-8 animate-fade-in">
@@ -213,13 +178,11 @@ export default function EventsPage() {
           ))}
         </div>
 
-        {/* City filter dropdown. 'all' shows events in every city;
-            defaults to the logged-in customer's own city (see the
-            effect above), and the customer is free to change it. */}
+        {/* City dropdown — value mirrors the URL param */}
         <select
           className="input max-w-xs"
-          value={cityId}
-          onChange={(e) => setCityId(e.target.value)}
+          value={cityIdFromUrl}
+          onChange={(e) => handleCityChange(e.target.value)}
         >
           <option value="all">All Cities</option>
           {cities.map((c) => (
@@ -251,7 +214,7 @@ export default function EventsPage() {
           <div className="text-5xl mb-4">🎪</div>
           <h3 className="text-xl font-semibold mb-2">No events found</h3>
           <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-            {category !== 'All' || cityId !== 'all'
+            {category !== 'All' || cityIdFromUrl !== 'all'
               ? 'Try adjusting your filters.'
               : 'No published events yet. Check back soon!'}
           </p>
@@ -262,7 +225,7 @@ export default function EventsPage() {
       {!loading && !error && events.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {events.map((event) => (
-            <EventCard key={event.event_id} event={event} />
+            <EventCard key={event.event_id} event={event} cityId={cityIdFromUrl} />
           ))}
         </div>
       )}
