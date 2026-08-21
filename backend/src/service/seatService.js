@@ -344,3 +344,290 @@ async function updateSectionPrice(eventId, section, newPrice) {
 
 
 module.exports = { generateSeatsForEvent, updateSectionPrice };
+
+
+// ============================================================
+// SEAT LOCKING — Redis + PostgreSQL
+//
+// Architecture (matches user's design):
+//   1. Redis holds temporary seat locks (5-min TTL)
+//   2. PostgreSQL is the source of truth for final bookings
+//   3. SELECT ... FOR UPDATE prevents double-booking at the DB level
+//
+// Seat statuses:
+//   - 'available' — free to select (white in UI)
+//   - 'held'      — temporarily locked in Redis (grey for others, blue for holder)
+//   - 'sold'      — permanently sold in DB (grey in UI)
+//
+// Redis key format: seat_lock:{eventId}:{seatId} → customerId
+// TTL: 300 seconds (5 minutes)
+// ============================================================
+
+const redis = require('../config/redis');
+
+const LOCK_TTL_SECONDS = 300; // 5 minutes
+
+
+// ============================================================
+// getSeatsForEvent(eventId)
+// ============================================================
+// Returns all seats for an event, grouped by section, with
+// real-time status merged from Redis (held seats) and DB
+// (sold seats). This feeds the seat map UI.
+//
+// Response shape:
+//   {
+//     sections: [
+//       {
+//         name: 'VIP',
+//         price: 12000,
+//         rows: [
+//           {
+//             label: 'A',
+//             seats: [
+//               { seat_id: 1, seat_number: 1, status: 'available' },
+//               { seat_id: 2, seat_number: 2, status: 'held', held_by_me: false },
+//               { seat_id: 3, seat_number: 3, status: 'sold' },
+//             ]
+//           }
+//         ]
+//       }
+//     ]
+//   }
+// ============================================================
+async function getSeatsForEvent(eventId, customerId = null) {
+  // Step 1: Get all seats from the database
+  const result = await pool.query(
+    `SELECT s.seat_id, s.section, s.row_label, s.seat_number,
+            s.price, s.status, s.version
+     FROM seats s
+     WHERE s.event_id = $1
+     ORDER BY s.section, s.row_label, s.seat_number`,
+    [eventId]
+  );
+
+  if (result.rows.length === 0) {
+    return { sections: [] };
+  }
+
+  // Step 2: Check Redis for held seats in bulk
+  // Build a pipeline to fetch all lock keys at once (1 round-trip).
+  const pipeline = redis.pipeline();
+  for (const seat of result.rows) {
+    pipeline.get(`seat_lock:${eventId}:${seat.seat_id}`);
+  }
+  const redisResults = await pipeline.exec();
+
+  // Step 3: Merge DB status with Redis holds
+  const sectionMap = {};
+
+  for (let i = 0; i < result.rows.length; i++) {
+    const seat = result.rows[i];
+    const [redisErr, lockedByCustomerId] = redisResults[i] || [null, null];
+
+    // Determine the real-time status
+    let status = seat.status; // 'available' or 'sold'
+    let heldByMe = false;
+
+    if (seat.status === 'sold') {
+      status = 'sold';
+    } else if (lockedByCustomerId) {
+      status = 'held';
+      heldByMe = customerId && lockedByCustomerId === String(customerId);
+    } else {
+      status = 'available';
+    }
+
+    // Group by section
+    if (!sectionMap[seat.section]) {
+      sectionMap[seat.section] = {
+        name: seat.section,
+        price: parseFloat(seat.price),
+        rows: {},
+      };
+    }
+
+    const section = sectionMap[seat.section];
+    if (!section.rows[seat.row_label]) {
+      section.rows[seat.row_label] = {
+        label: seat.row_label,
+        seats: [],
+      };
+    }
+
+    section.rows[seat.row_label].seats.push({
+      seat_id: seat.seat_id,
+      seat_number: seat.seat_number,
+      status,
+      held_by_me: heldByMe,
+    });
+  }
+
+  // Convert row maps to sorted arrays
+  const sections = Object.values(sectionMap).map(section => ({
+    ...section,
+    rows: Object.values(section.rows).sort((a, b) =>
+      a.label.localeCompare(b.label)
+    ),
+  }));
+
+  return { sections };
+}
+
+
+// ============================================================
+// lockSeats(eventId, seatIds, customerId)
+// ============================================================
+// Locks selected seats using a Redis + DB dual check:
+//
+// 1. START a DB transaction
+// 2. SELECT ... FOR UPDATE the requested seats (DB-level lock)
+// 3. Check all are 'available' in DB (not already sold)
+// 4. Check none are held in Redis by ANOTHER customer
+// 5. Set Redis keys with 5-min TTL (atomic MULTI/EXEC)
+// 6. COMMIT the DB transaction
+//
+// If any check fails, the entire operation is rejected.
+// Returns: { locked: true, seatIds: [...], expiresIn: 300 }
+// ============================================================
+async function lockSeats(eventId, seatIds, customerId) {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Step 1: SELECT FOR UPDATE — locks the rows at DB level
+    // so no other transaction can modify them until we COMMIT.
+    const seatResult = await client.query(
+      `SELECT seat_id, status, version
+       FROM seats
+       WHERE event_id = $1 AND seat_id = ANY($2::int[])
+       FOR UPDATE`,
+      [eventId, seatIds]
+    );
+
+    // Verify all requested seats exist
+    if (seatResult.rows.length !== seatIds.length) {
+      throw new Error('One or more seat IDs are invalid');
+    }
+
+    // Step 2: Check DB status — none should be 'sold'
+    const soldSeats = seatResult.rows.filter(s => s.status === 'sold');
+    if (soldSeats.length > 0) {
+      throw new Error(
+        `Seats already sold: ${soldSeats.map(s => s.seat_id).join(', ')}`
+      );
+    }
+
+    // Step 3: Check Redis — none should be held by ANOTHER customer
+    const pipeline = redis.pipeline();
+    for (const seatId of seatIds) {
+      pipeline.get(`seat_lock:${eventId}:${seatId}`);
+    }
+    const redisResults = await pipeline.exec();
+
+    for (let i = 0; i < seatIds.length; i++) {
+      const [err, holder] = redisResults[i] || [null, null];
+      if (holder && holder !== String(customerId)) {
+        throw new Error(
+          `Seat ${seatIds[i]} is currently held by another customer`
+        );
+      }
+    }
+
+    // Step 4: Set Redis locks with 5-min TTL (atomic pipeline)
+    const lockPipeline = redis.pipeline();
+    for (const seatId of seatIds) {
+      lockPipeline.set(
+        `seat_lock:${eventId}:${seatId}`,
+        String(customerId),
+        'EX',
+        LOCK_TTL_SECONDS
+      );
+    }
+    await lockPipeline.exec();
+
+    // Step 5: COMMIT the DB transaction (releases FOR UPDATE locks)
+    await client.query('COMMIT');
+
+    return {
+      locked: true,
+      seatIds,
+      expiresIn: LOCK_TTL_SECONDS,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+
+// ============================================================
+// unlockSeats(eventId, seatIds, customerId)
+// ============================================================
+// Removes Redis locks — only if they belong to this customer.
+// Called on payment failure or manual cancellation.
+// ============================================================
+async function unlockSeats(eventId, seatIds, customerId) {
+  const pipeline = redis.pipeline();
+
+  for (const seatId of seatIds) {
+    pipeline.get(`seat_lock:${eventId}:${seatId}`);
+  }
+  const results = await pipeline.exec();
+
+  // Only delete locks that belong to this customer
+  const delPipeline = redis.pipeline();
+  let unlocked = 0;
+
+  for (let i = 0; i < seatIds.length; i++) {
+    const [err, holder] = results[i] || [null, null];
+    if (holder === String(customerId)) {
+      delPipeline.del(`seat_lock:${eventId}:${seatIds[i]}`);
+      unlocked++;
+    }
+  }
+
+  if (unlocked > 0) {
+    await delPipeline.exec();
+  }
+
+  return { unlocked };
+}
+
+
+// ============================================================
+// checkLockOwnership(eventId, seatIds, customerId)
+// ============================================================
+// Verifies the customer still holds all locks before payment.
+// Returns true only if ALL seats are still locked by this customer.
+// ============================================================
+async function checkLockOwnership(eventId, seatIds, customerId) {
+  const pipeline = redis.pipeline();
+  for (const seatId of seatIds) {
+    pipeline.get(`seat_lock:${eventId}:${seatId}`);
+  }
+  const results = await pipeline.exec();
+
+  for (let i = 0; i < seatIds.length; i++) {
+    const [err, holder] = results[i] || [null, null];
+    if (holder !== String(customerId)) {
+      return false; // Lock expired or stolen
+    }
+  }
+
+  return true;
+}
+
+
+module.exports = {
+  generateSeatsForEvent,
+  updateSectionPrice,
+  getSeatsForEvent,
+  lockSeats,
+  unlockSeats,
+  checkLockOwnership,
+  LOCK_TTL_SECONDS,
+};

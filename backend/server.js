@@ -98,6 +98,27 @@ app.use('/api/venues', require('./src/routes/venueRoutes'));
 // listing/viewing is any authenticated user.
 app.use('/api/events', require('./src/routes/eventRoutes'));
 
+// Seat routes — nested under events (seat map + locking).
+// GET /api/events/:eventId/seats    → seat map with real-time status
+// POST /api/events/:eventId/seats/lock → lock seats in Redis
+app.use('/api/events/:eventId/seats', require('./src/routes/seatRoutes'));
+
+// Waiting room routes — queue management for high-demand events.
+// POST /api/events/:eventId/waiting-room/join → try to get admitted
+// GET  /api/events/:eventId/waiting-room/position → poll queue position
+// POST /api/events/:eventId/waiting-room/release → free up slot
+app.use('/api/events/:eventId/waiting-room', require('./src/routes/waitingRoomRoutes'));
+
+// Order routes — create order, process payment, get order details.
+// POST /api/orders → create from locked seats
+// POST /api/orders/:orderId/pay → pay + confirm
+app.use('/api/orders', require('./src/routes/orderRoutes'));
+
+// Ticket routes — retrieve customer's tickets with QR codes.
+// GET /api/tickets/my → all tickets
+// GET /api/tickets/:ticketId → single ticket
+app.use('/api/tickets', require('./src/routes/ticketRoutes'));
+
 
 // ============================================================
 // START SERVER

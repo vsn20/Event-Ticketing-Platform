@@ -23,7 +23,7 @@
 
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
@@ -75,6 +75,11 @@ export default function EventDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  // Live clock — ticks every second so the countdown and
+  // canBuyTickets update in real time without a page refresh.
+  const [currentTime, setCurrentTime] = useState(() => new Date());
+  const timerRef = useRef(null);
+
   // ----------------------------------------------------------
   // Fetch event details on mount
   // ----------------------------------------------------------
@@ -94,6 +99,43 @@ export default function EventDetailPage() {
 
     fetchEvent();
   }, [params.id, authLoading]);
+
+  // ---- Determine if tickets are buyable ----
+  // Computed here (before early returns) so the useEffect below
+  // always runs in the same hook order.
+  const saleStart = event?.sale_window_start ? new Date(event.sale_window_start) : null;
+  const saleEnd = event?.sale_window_end ? new Date(event.sale_window_end) : null;
+  const isPublishedOrLive = event?.status === 'published' || event?.status === 'live';
+  const saleNotStarted = saleStart && currentTime < saleStart;
+  const saleClosed = saleEnd && currentTime > saleEnd;
+  const canBuyTickets = isPublishedOrLive && !saleNotStarted && !saleClosed;
+
+  // Start the 1-second ticker when the sale hasn't started yet,
+  // so the countdown updates live and the button auto-enables.
+  useEffect(() => {
+    if (!saleNotStarted) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+
+    timerRef.current = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+
+    return () => clearInterval(timerRef.current);
+  }, [saleNotStarted]);
+
+  // Helper: format seconds into "Xh Ym Zs"
+  function formatCountdown(ms) {
+    if (ms <= 0) return '0s';
+    const totalSecs = Math.floor(ms / 1000);
+    const h = Math.floor(totalSecs / 3600);
+    const m = Math.floor((totalSecs % 3600) / 60);
+    const s = totalSecs % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
 
   // ---- Loading state ----
   if (loading) {
@@ -122,9 +164,6 @@ export default function EventDetailPage() {
       </div>
     );
   }
-
-  // ---- Determine if tickets are buyable ----
-  const canBuyTickets = event.status === 'published' || event.status === 'live';
 
   return (
     <div className="page-container py-8 animate-fade-in">
@@ -278,10 +317,19 @@ export default function EventDetailPage() {
               </p>
             )}
 
-            {/* CTA Button */}
+            {/* CTA Button — sale window aware */}
             {canBuyTickets ? (
-              <button className="btn-primary w-full text-center">
+              <Link href={`/events/${event.event_id}/waiting-room`}
+                    className="btn-primary w-full text-center no-underline block">
                 🎫 Buy Tickets
+              </Link>
+            ) : isPublishedOrLive && saleNotStarted ? (
+              <button className="btn-secondary w-full" disabled>
+                🔒 Sales open {formatDate(event.sale_window_start)}
+              </button>
+            ) : isPublishedOrLive && saleClosed ? (
+              <button className="btn-secondary w-full" disabled>
+                Sales Closed
               </button>
             ) : event.status === 'sold_out' ? (
               <button className="btn-secondary w-full" disabled>
@@ -297,11 +345,29 @@ export default function EventDetailPage() {
               </button>
             )}
 
+            {/* Live countdown when sale hasn't started */}
+            {isPublishedOrLive && saleNotStarted && saleStart && (
+              <div className="mt-3 p-3 rounded-xl text-center"
+                style={{
+                  background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                  color: 'white',
+                }}>
+                <div className="text-xs mb-1">🕐 Tickets go live in</div>
+                <div className="text-xl font-bold font-mono">
+                  {formatCountdown(saleStart - currentTime)}
+                </div>
+              </div>
+            )}
+
             <p className="text-xs text-center mt-3"
                style={{ color: 'var(--text-muted)' }}>
               {canBuyTickets
                 ? 'Seats are held for 5 minutes during checkout'
-                : 'Tickets are not available yet'}
+                : saleNotStarted
+                  ? `Sales window opens ${formatDate(event.sale_window_start)}`
+                  : saleClosed
+                    ? 'The sales window for this event has closed'
+                    : 'Tickets are not available yet'}
             </p>
           </div>
         </div>
