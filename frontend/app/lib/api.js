@@ -98,7 +98,7 @@ async function request(method, path, body = null) {
   // throw an error with the server's error message so the calling
   // component can display it to the user.
   if (!response.ok) {
-    const errorMessage = data?.error || `Request failed with status ${response.status}`;
+    const errorMessage = data?.error || data?.message || `Request failed with status ${response.status}`;
     throw new Error(errorMessage);
   }
 

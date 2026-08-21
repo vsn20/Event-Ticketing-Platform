@@ -67,11 +67,12 @@ export default function CheckoutPage() {
 
     if (remaining <= 0) {
       setError('Your seat hold has expired.');
-      // Redirect to event page after a short delay
-      setTimeout(() => {
-        sessionStorage.removeItem('checkout_data');
-        router.push(`/events/${data.eventId}`);
-      }, 2000);
+      // Don't navigate here — the dedicated expiry effect below
+      // (watching `timeLeft`) handles ALL navigation-on-expiry,
+      // whether the countdown ran out live on this page or the
+      // customer arrived on an already-expired link. Having only
+      // one place that triggers this redirect avoids the two
+      // effects racing each other or double-navigating.
     }
   }, [router]);
 
@@ -98,28 +99,78 @@ export default function CheckoutPage() {
   }, [checkoutData, authLoading, order]);
 
   // ----------------------------------------------------------
-  // Countdown timer — redirects to event page on expiry
+  // Countdown timer.
+  //
+  // IMPORTANT: this effect's setInterval callback does ONLY a
+  // pure state update — it just decrements the number. It does
+  // NOT call router.push, sessionStorage, or anything else with
+  // a side effect.
+  //
+  // WHY: the functional updater passed to setTimeLeft (the
+  // `prev => ...` function) can run during React's render/
+  // reconciliation phase, not strictly "after" it. Calling
+  // router.push() — which itself triggers a state update inside
+  // Next.js's Router component — from INSIDE that updater
+  // function means you're updating one component (Router) while
+  // React is in the middle of processing an update for another
+  // component (CheckoutPage). That's exactly what triggers the
+  // "Cannot update a component while rendering a different
+  // component" warning/error.
+  //
+  // THE FIX: keep the interval's job to ONE thing — decrementing
+  // a number. A separate effect below WATCHES timeLeft and reacts
+  // to it hitting 0 with the actual side effects (clearing
+  // storage, navigating away). Reacting to a state change in its
+  // own effect (after the render that produced it has fully
+  // committed) is the correct, safe place for side effects like
+  // navigation — as opposed to reacting inside the setState call
+  // that produced the change.
   // ----------------------------------------------------------
   useEffect(() => {
     if (timeLeft <= 0) return;
 
     timerRef.current = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) {
-          clearInterval(timerRef.current);
-          // Timeout — redirect back to event page
-          sessionStorage.removeItem('checkout_data');
-          if (checkoutData?.eventId) {
-            router.push(`/events/${checkoutData.eventId}`);
-          }
-          return 0;
-        }
-        return prev - 1;
-      });
+      // Pure — just clamps at 0, no side effects of any kind here.
+      setTimeLeft((prev) => Math.max(prev - 1, 0));
     }, 1000);
 
     return () => clearInterval(timerRef.current);
+    // Only re-run when checkoutData/router identity changes (e.g.
+    // on first load) — NOT on every timeLeft tick, otherwise we'd
+    // tear down and rebuild the interval every single second.
   }, [checkoutData, router]);
+
+  // ----------------------------------------------------------
+  // Expiry side effect — reacts to timeLeft reaching 0.
+  //
+  // This is the ONLY place in this component that navigates away
+  // on expiry — whether the countdown ran out live on this page,
+  // or the customer loaded the checkout page on an already-
+  // expired link. Having a single source of truth for this avoids
+  // two different effects racing to both trigger a redirect.
+  //
+  // This runs as its own effect, AFTER the render that set
+  // timeLeft to 0 has fully committed — which is the correct,
+  // React-sanctioned place to trigger navigation in response to
+  // a state change, rather than from inside the setState updater
+  // that produced the change (see the countdown effect above for
+  // why that matters).
+  //
+  // A short 2-second delay gives the customer a moment to actually
+  // read the "seat hold expired" message before being redirected.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (timeLeft !== 0 || !checkoutData) return;
+
+    clearInterval(timerRef.current);
+
+    const redirectTimeout = setTimeout(() => {
+      sessionStorage.removeItem('checkout_data');
+      router.push(`/events/${checkoutData.eventId}`);
+    }, 2000);
+
+    return () => clearTimeout(redirectTimeout);
+  }, [timeLeft, checkoutData, router]);
 
   // ----------------------------------------------------------
   // Format time as M:SS
@@ -179,11 +230,40 @@ export default function CheckoutPage() {
   }, [order, paying, checkoutData, user]);
 
   // ----------------------------------------------------------
+  // Mark payment as completed — DEMO ONLY, skips Razorpay entirely.
+  //
+  // Calls POST /orders/:orderId/mock-pay directly, which confirms
+  // the order server-side without any real (or test-mode) payment
+  // gateway involved. This exists purely so this project can be
+  // demoed/graded without needing a funded Razorpay test account
+  // or anyone entering card details — see the comment on the
+  // backend route (orderRoutes.js) for the full reasoning.
+  // ----------------------------------------------------------
+  const handleMockPay = useCallback(async () => {
+    if (!order || paying) return;
+
+    setPaying(true);
+    setError('');
+
+    try {
+      await api.post(`/orders/${order.orderId}/mock-pay`);
+
+      sessionStorage.removeItem('checkout_data');
+      clearInterval(timerRef.current);
+
+      router.push(`/confirmation/${order.orderId}`);
+    } catch (err) {
+      setError(err.message);
+      setPaying(false);
+    }
+  }, [order, paying, router]);
+
+  // ----------------------------------------------------------
   // Handle successful Razorpay payment
   // ----------------------------------------------------------
   async function handlePaymentSuccess(response) {
     try {
-      const result = await api.post(`/orders/${order.orderId}/pay`, {
+      await api.post(`/orders/${order.orderId}/pay`, {
         razorpay_order_id: response.razorpay_order_id,
         razorpay_payment_id: response.razorpay_payment_id,
         razorpay_signature: response.razorpay_signature,
@@ -314,6 +394,26 @@ export default function CheckoutPage() {
           <p className="text-xs text-center mt-3" style={{ color: 'var(--text-muted)' }}>
             Secure payment powered by Razorpay
           </p>
+
+          {/* ---- Mock Payment Button (demo/portfolio only) ----
+              Skips Razorpay entirely — confirms the order directly.
+              Kept visually distinct (outline style, smaller) from
+              the real Pay button so it reads as a "dev shortcut,"
+              not the primary intended path. */}
+          <button
+            onClick={handleMockPay}
+            disabled={paying || isExpired || !order}
+            className="w-full py-3 mt-3 text-sm font-semibold rounded-xl"
+            style={{
+              background: 'transparent',
+              border: '1.5px dashed var(--color-primary)',
+              color: 'var(--color-primary)',
+              opacity: (paying || isExpired || !order) ? 0.5 : 1,
+              cursor: (paying || isExpired || !order) ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {paying ? 'Processing...' : '✅ Mark Payment Completed (Demo — No Real Payment)'}
+          </button>
         </>
       )}
     </div>

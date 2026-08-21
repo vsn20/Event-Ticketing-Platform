@@ -8,9 +8,12 @@
 //      + confirm order (seats → sold, tickets + QR generated)
 //
 // Endpoints:
-//   POST /api/orders                → Create order + Razorpay order
-//   POST /api/orders/:orderId/pay   → Verify payment + confirm
-//   GET  /api/orders/:orderId       → Get order details
+//   POST /api/orders                    → Create order + Razorpay order
+//   POST /api/orders/:orderId/pay       → Verify payment + confirm
+//   POST /api/orders/:orderId/mock-pay  → DEMO ONLY: skip Razorpay
+//                                          entirely, confirm the order
+//                                          as if payment succeeded.
+//   GET  /api/orders/:orderId           → Get order details
 // ============================================================
 
 const express = require('express');
@@ -103,7 +106,7 @@ router.post('/:orderId/pay', authenticate, async (req, res) => {
       const confirmedOrder = await confirmOrder(orderId, req.user.id);
 
       // Release waiting room slot so next person can enter
-      try { await releaseSlot(order.eventId, req.user.id); } catch {}
+      try { await releaseSlot(order.eventId, req.user.id); } catch { }
 
       res.json(confirmedOrder);
     } else {
@@ -111,13 +114,82 @@ router.post('/:orderId/pay', authenticate, async (req, res) => {
       await failOrder(orderId, req.user.id);
 
       // Release waiting room slot
-      try { await releaseSlot(order.eventId, req.user.id); } catch {}
+      try { await releaseSlot(order.eventId, req.user.id); } catch { }
 
       res.status(400).json({ message: 'Payment verification failed' });
     }
   } catch (err) {
     console.error('Error processing payment:', err);
     res.status(500).json({ message: err.message });
+  }
+});
+
+
+// ============================================================
+// POST /api/orders/:orderId/mock-pay
+// ============================================================
+// DEMO-ONLY ENDPOINT. Skips Razorpay entirely — no checkout
+// modal, no signature verification, no real (or even test-mode)
+// payment gateway call. It just confirms the order directly, as
+// if payment had succeeded.
+//
+// WHY THIS EXISTS SEPARATELY FROM THE `mock` FALLBACK IN
+// paymentService.js:
+//   paymentService already auto-mocks payment when RAZORPAY_KEY_ID
+//   / RAZORPAY_KEY_SECRET aren't set in the environment — but that
+//   only helps if you've deliberately left those env vars empty.
+//   If real Razorpay keys ARE configured (e.g. you want to keep
+//   the real checkout flow working for demo purposes too), the
+//   normal /pay endpoint would actually try to verify a real
+//   Razorpay signature, which a fake mock response can't produce.
+//
+//   This endpoint sidesteps that entirely — it's a second,
+//   independent "confirm this order" path that never touches
+//   Razorpay at all, regardless of whether real keys are
+//   configured. This is what lets a portfolio/demo deployment
+//   offer BOTH "pay for real via Razorpay test mode" AND "skip
+//   payment, just mark it complete" as two separate buttons on
+//   the same checkout page.
+//
+// SECURITY NOTE: this endpoint intentionally has no payment
+// verification at all — anyone who can create an order can
+// confirm it for free. That's fine for a portfolio project where
+// no real money or real inventory is at stake, but this route
+// should be removed (or gated behind an admin/dev-only flag)
+// before this code is ever used for a real production ticketing
+// system with real payments.
+// ============================================================
+router.post('/:orderId/mock-pay', authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== 'customer') {
+      return res.status(403).json({ message: 'Only customers can pay for orders' });
+    }
+
+    const { orderId } = req.params;
+
+    // Step 1: Get order — also confirms it belongs to this customer
+    const order = await getOrderById(orderId, req.user.id);
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    if (order.status !== 'pending') {
+      return res.status(400).json({ message: `Order is already ${order.status}` });
+    }
+
+    // Step 2: Confirm directly — same seats->sold + optimistic
+    // locking + ticket/QR generation as the real payment path,
+    // just without any Razorpay call in between.
+    const confirmedOrder = await confirmOrder(orderId, req.user.id);
+
+    // Release their waiting room slot so the next person can enter,
+    // same as the real payment success path does.
+    try { await releaseSlot(order.eventId, req.user.id); } catch { }
+
+    res.json(confirmedOrder);
+  } catch (err) {
+    console.error('Error mock-confirming order:', err);
+    res.status(400).json({ message: err.message });
   }
 });
 
