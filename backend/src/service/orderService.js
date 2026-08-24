@@ -1,397 +1,373 @@
 // ============================================================
-// orderService.js — Order creation, confirmation, and failure
+// orderService.js — Order creation and finalization
 //
-// This service handles the "shopping cart" → "payment" → "done"
-// lifecycle. Each step follows the dual Redis + PostgreSQL
-// architecture:
+// FLOW:
+//   1. createOrder(userId, eventId, seatIds, holdId, sessionId)
+//      → creates PENDING_PAYMENT order in PostgreSQL
+//      → creates Razorpay order
 //
-//   1. createOrder  — Verify Redis locks, create order + order_items
-//                     (freeze prices at this moment)
-//   2. confirmOrder — Process payment, mark seats SOLD in DB,
-//                     generate tickets + QR codes, remove Redis locks
-//   3. failOrder    — Mark order failed, remove Redis locks,
-//                     seats go back to available
+//   2. confirmOrder(orderId, userId, razorpayPayment)
+//      → validates hold + payment timer
+//      → Lua: HELD → FINALIZING (atomic)
+//      → short PG TX: lock seats, verify AVAILABLE, → BOOKED
+//      → Redis: FINALIZING → BOOKED
+//      → generates tickets + QR codes
 //
-// The optimistic lock on seats.version prevents the edge case
-// where a Redis lock expires mid-payment and someone else tries
-// to book the same seat. The version check on UPDATE ensures
-// only one transaction can claim the seat.
+//   3. failOrder(orderId, userId)
+//      → releases Redis holds
+//      → marks order as FAILED
+//
+// IDEMPOTENCY:
+//   If an order is already CONFIRMED, confirmOrder returns the
+//   existing booking without creating duplicates.
+//
+// NEVER keeps a PG transaction open during payment.
 // ============================================================
 
 const pool = require('../config/db');
-const redis = require('../config/redis');
 const { v4: uuidv4 } = require('uuid');
-const { checkLockOwnership, unlockSeats } = require('./seatService');
+const {
+  finalizeSeats,
+  confirmSeats,
+  rollbackFinalize,
+  releaseSeats,
+} = require('./redisInventoryService');
 const { generateQRCode } = require('./qrCodeService');
-
-const LOCK_TTL_SECONDS = 300;
+const redis = require('../config/redis');
 
 
 // ============================================================
-// createOrder(customerId, eventId, seatIds)
+// createOrder(userId, eventId, seatIds, holdId, sessionId)
 // ============================================================
-// Creates a pending order with frozen prices.
-//
-// Steps:
-//   1. Verify customer still holds all seat locks (Redis)
-//   2. Look up current prices from event_section_pricing
-//   3. Create order row (pending, with idempotency key)
-//   4. Create order_items with frozen prices
-//   5. Return order details
+// Creates a PENDING_PAYMENT order with frozen prices.
+// Does NOT touch Redis or finalize anything yet.
 // ============================================================
-async function createOrder(customerId, eventId, seatIds) {
-  // Step 1: Verify locks
-  const ownsLocks = await checkLockOwnership(eventId, seatIds, customerId);
-  if (!ownsLocks) {
-    throw new Error(
-      'Your seat hold has expired. Please go back and select seats again.'
+async function createOrder(userId, eventId, seatIds, holdId, sessionId) {
+  // Get seat prices (frozen at checkout time)
+  const seatResult = await pool.query(
+    `SELECT seat_id, section, row_label, seat_number, price
+     FROM seats
+     WHERE seat_id = ANY($1) AND event_id = $2`,
+    [seatIds, eventId]
+  );
+
+  if (seatResult.rows.length !== seatIds.length) {
+    throw new Error('Some seats not found');
+  }
+
+  const totalAmount = seatResult.rows.reduce(
+    (sum, s) => sum + parseFloat(s.price), 0
+  );
+
+  const idempotencyKey = uuidv4();
+
+  // Insert order
+  const orderResult = await pool.query(
+    `INSERT INTO orders (customer_id, event_id, status, total_amount, idempotency_key)
+     VALUES ($1, $2, 'pending', $3, $4)
+     RETURNING order_id`,
+    [userId, eventId, totalAmount, idempotencyKey]
+  );
+
+  const orderId = orderResult.rows[0].order_id;
+
+  // Insert order items (frozen prices)
+  for (const seat of seatResult.rows) {
+    await pool.query(
+      `INSERT INTO order_items (order_id, seat_id, price_at_purchase)
+       VALUES ($1, $2, $3)`,
+      [orderId, seat.seat_id, seat.price]
     );
   }
 
-  const client = await pool.connect();
+  // Store order metadata in Redis for payment phase validation
+  await redis.set(
+    `order_meta:${orderId}`,
+    JSON.stringify({
+      orderId,
+      userId: String(userId),
+      eventId: String(eventId),
+      holdId,
+      sessionId,
+      seatIds,
+      totalAmount,
+      createdAt: Date.now(),
+    }),
+    'EX',
+    600 // 10 min safety margin
+  );
 
-  try {
-    await client.query('BEGIN');
-
-    // Step 2: Get seat details with current prices
-    const seatsResult = await client.query(
-      `SELECT s.seat_id, s.section, s.row_label, s.seat_number,
-              s.price, s.status, s.version
-       FROM seats s
-       WHERE s.event_id = $1 AND s.seat_id = ANY($2::int[])
-       FOR UPDATE`,
-      [eventId, seatIds]
-    );
-
-    // Verify all seats exist and are available
-    for (const seat of seatsResult.rows) {
-      if (seat.status === 'sold') {
-        throw new Error(
-          `Seat ${seat.section} ${seat.row_label}-${seat.seat_number} is already sold`
-        );
-      }
-    }
-
-    // Step 3: Calculate total
-    const totalAmount = seatsResult.rows.reduce(
-      (sum, s) => sum + parseFloat(s.price), 0
-    );
-
-    // Step 4: Create order with idempotency key
-    const idempotencyKey = uuidv4();
-    const orderResult = await client.query(
-      `INSERT INTO orders (customer_id, event_id, status, total_amount, idempotency_key)
-       VALUES ($1, $2, 'pending', $3, $4)
-       RETURNING order_id, status, total_amount, created_at`,
-      [customerId, eventId, totalAmount, idempotencyKey]
-    );
-
-    const order = orderResult.rows[0];
-
-    // Step 5: Create order_items — freeze price at this moment
-    for (const seat of seatsResult.rows) {
-      await client.query(
-        `INSERT INTO order_items (order_id, seat_id, price_at_purchase)
-         VALUES ($1, $2, $3)`,
-        [order.order_id, seat.seat_id, seat.price]
-      );
-    }
-
-    await client.query('COMMIT');
-
-    return {
-      orderId: order.order_id,
-      eventId: parseInt(eventId),
-      status: order.status,
-      totalAmount: parseFloat(order.total_amount),
-      seats: seatsResult.rows.map(s => ({
-        seatId: s.seat_id,
-        section: s.section,
-        row: s.row_label,
-        seatNumber: s.seat_number,
-        price: parseFloat(s.price),
-      })),
-      createdAt: order.created_at,
-    };
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+  return {
+    orderId,
+    eventId,
+    holdId,
+    totalAmount,
+    seats: seatResult.rows,
+    idempotencyKey,
+  };
 }
 
 
 // ============================================================
-// confirmOrder(orderId, customerId)
+// confirmOrder(orderId, userId)
 // ============================================================
-// Called after successful payment. This is where the seat
-// actually becomes SOLD in the database.
+// Called AFTER payment succeeds. Performs:
+//   1. Idempotency check (already confirmed? return existing)
+//   2. Validate hold + payment timer
+//   3. Lua: HELD → FINALIZING (atomic)
+//   4. Short PG TX: seats AVAILABLE → BOOKED, create tickets
+//   5. Redis: FINALIZING → BOOKED (persists forever)
 //
-// Steps:
-//   1. Look up the order and its items
-//   2. SELECT ... FOR UPDATE seats (DB-level lock)
-//   3. Optimistic lock check: version must match
-//   4. UPDATE seats → status='sold', version++
-//   5. UPDATE order → status='confirmed'
-//   6. Create payment record
-//   7. Generate tickets with QR codes
-//   8. Remove Redis locks
-//   9. Return confirmed order with tickets
+// NEVER opens PG TX during payment.
 // ============================================================
-async function confirmOrder(orderId, customerId) {
-  const client = await pool.connect();
+async function confirmOrder(orderId, userId) {
+  // ---- Step 0: Idempotency ----
+  const existingOrder = await pool.query(
+    `SELECT order_id, status FROM orders WHERE order_id = $1 AND customer_id = $2`,
+    [orderId, userId]
+  );
 
+  if (existingOrder.rows.length === 0) {
+    throw new Error('Order not found');
+  }
+
+  if (existingOrder.rows[0].status === 'confirmed') {
+    // Already confirmed — return existing booking (idempotent)
+    return getConfirmedOrderDetails(orderId);
+  }
+
+  if (existingOrder.rows[0].status !== 'pending') {
+    throw new Error(`Order is ${existingOrder.rows[0].status}, cannot confirm`);
+  }
+
+  // ---- Step 1: Get order metadata from Redis ----
+  const metaRaw = await redis.get(`order_meta:${orderId}`);
+  if (!metaRaw) {
+    throw new Error('Order metadata expired — session timed out');
+  }
+  const meta = JSON.parse(metaRaw);
+
+  // Validate user ownership
+  if (meta.userId !== String(userId)) {
+    throw new Error('Order does not belong to this user');
+  }
+
+  // ---- Step 2: Check payment timer ----
+  const paymentTimer = await redis.get(`payment_timer:${meta.sessionId}`);
+  if (!paymentTimer) {
+    // Payment timer expired — release holds and fail order
+    await releaseSeats(meta.eventId, meta.seatIds, meta.holdId);
+    await pool.query(
+      `UPDATE orders SET status = 'expired', updated_at = now() WHERE order_id = $1`,
+      [orderId]
+    );
+    throw new Error('Payment timer expired. Seats have been released.');
+  }
+
+  // ---- Step 3: Lua — HELD → FINALIZING (atomic) ----
+  const finalizeResult = await finalizeSeats(meta.eventId, meta.seatIds, meta.holdId);
+
+  if (!finalizeResult.success) {
+    // Hold expired or stolen — fail the order
+    await pool.query(
+      `UPDATE orders SET status = 'failed', updated_at = now() WHERE order_id = $1`,
+      [orderId]
+    );
+    throw new Error('Seat holds expired. Cannot finalize booking.');
+  }
+
+  // ---- Step 4: Short PostgreSQL transaction ----
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Step 1: Get order
-    const orderResult = await client.query(
-      `SELECT o.order_id, o.customer_id, o.event_id, o.status, o.total_amount
-       FROM orders o
-       WHERE o.order_id = $1 AND o.customer_id = $2
+    // Lock seat rows — short lock, no external calls
+    const lockResult = await client.query(
+      `SELECT seat_id, status, version
+       FROM seats
+       WHERE seat_id = ANY($1) AND event_id = $2
        FOR UPDATE`,
-      [orderId, customerId]
+      [meta.seatIds, meta.eventId]
     );
 
-    if (orderResult.rows.length === 0) {
-      throw new Error('Order not found');
-    }
-
-    const order = orderResult.rows[0];
-
-    if (order.status !== 'pending') {
-      throw new Error(`Order is already ${order.status}`);
-    }
-
-    // Step 2: Get order items with seat details
-    const itemsResult = await client.query(
-      `SELECT oi.seat_id, oi.price_at_purchase,
-              s.section, s.row_label, s.seat_number, s.status, s.version
-       FROM order_items oi
-       JOIN seats s ON oi.seat_id = s.seat_id
-       WHERE oi.order_id = $1
-       FOR UPDATE OF s`,
-      [orderId]
-    );
-
-    // Step 3: Optimistic lock — check all seats are still available
-    for (const item of itemsResult.rows) {
-      if (item.status === 'sold') {
-        throw new Error(
-          `Seat ${item.section} ${item.row_label}-${item.seat_number} was sold by another transaction`
-        );
-      }
-    }
-
-    // Step 4: Mark seats as SOLD (with version increment)
-    const seatIds = [];
-    for (const item of itemsResult.rows) {
-      const updateResult = await client.query(
-        `UPDATE seats
-         SET status = 'sold', version = version + 1
-         WHERE seat_id = $1 AND version = $2
-         RETURNING seat_id`,
-        [item.seat_id, item.version]
+    // Verify ALL seats are AVAILABLE in PostgreSQL
+    const allAvailable = lockResult.rows.every(s => s.status === 'available');
+    if (!allAvailable || lockResult.rows.length !== meta.seatIds.length) {
+      await client.query('ROLLBACK');
+      // Rollback Redis FINALIZING → AVAILABLE
+      await rollbackFinalize(meta.eventId, meta.seatIds, meta.holdId);
+      await pool.query(
+        `UPDATE orders SET status = 'failed', updated_at = now() WHERE order_id = $1`,
+        [orderId]
       );
-
-      // If version changed, someone else modified this seat
-      if (updateResult.rows.length === 0) {
-        throw new Error(
-          `Concurrency conflict on seat ${item.section} ${item.row_label}-${item.seat_number}`
-        );
-      }
-
-      seatIds.push(item.seat_id);
+      throw new Error('Seats no longer available in database');
     }
 
-    // Step 5: Update order → confirmed
+    // UPDATE seats → BOOKED
     await client.query(
-      `UPDATE orders SET status = 'confirmed', updated_at = now()
-       WHERE order_id = $1`,
+      `UPDATE seats
+       SET status = 'booked', version = version + 1
+       WHERE seat_id = ANY($1) AND event_id = $2 AND status = 'available'`,
+      [meta.seatIds, meta.eventId]
+    );
+
+    // UPDATE order → CONFIRMED
+    await client.query(
+      `UPDATE orders SET status = 'confirmed', updated_at = now() WHERE order_id = $1`,
       [orderId]
     );
 
-    // Step 6: Create payment record
-    await client.query(
-      `INSERT INTO payments (order_id, provider, provider_payment_id, amount, status)
-       VALUES ($1, 'mock', $2, $3, 'succeeded')`,
-      [orderId, `mock_pay_${uuidv4().slice(0, 8)}`, order.total_amount]
-    );
-
-    // Step 7: Generate tickets with QR codes
-    const tickets = [];
-    for (const item of itemsResult.rows) {
-      const qrData = {
-        ticketId: null, // will be set after insert
-        eventId: order.event_id,
-        seatId: item.seat_id,
-        section: item.section,
-        row: item.row_label,
-        seatNumber: item.seat_number,
-      };
-
+    // INSERT tickets + QR codes
+    for (const seatId of meta.seatIds) {
+      const qrData = JSON.stringify({
+        orderId,
+        seatId,
+        eventId: meta.eventId,
+        ts: Date.now(),
+      });
       const qrCode = await generateQRCode(qrData);
 
-      const ticketResult = await client.query(
+      await client.query(
         `INSERT INTO tickets (order_id, seat_id, price, qr_code)
-         VALUES ($1, $2, $3, $4)
-         RETURNING ticket_id`,
-        [orderId, item.seat_id, item.price_at_purchase, qrCode]
+         VALUES ($1, $2,
+           (SELECT price FROM seats WHERE seat_id = $2),
+           $3)`,
+        [orderId, seatId, qrCode]
       );
-
-      tickets.push({
-        ticketId: ticketResult.rows[0].ticket_id,
-        section: item.section,
-        row: item.row_label,
-        seatNumber: item.seat_number,
-        price: parseFloat(item.price_at_purchase),
-        qrCode,
-      });
     }
 
     await client.query('COMMIT');
-
-    // Step 8: Remove Redis locks (after commit — fire and forget)
-    try {
-      const delPipeline = redis.pipeline();
-      for (const seatId of seatIds) {
-        delPipeline.del(`seat_lock:${order.event_id}:${seatId}`);
-      }
-      await delPipeline.exec();
-    } catch {
-      // Redis cleanup failure is non-fatal — TTL will expire anyway
-    }
-
-    return {
-      orderId: order.order_id,
-      eventId: order.event_id,
-      status: 'confirmed',
-      totalAmount: parseFloat(order.total_amount),
-      tickets,
-    };
   } catch (err) {
     await client.query('ROLLBACK');
+    // Rollback Redis FINALIZING → AVAILABLE
+    await rollbackFinalize(meta.eventId, meta.seatIds, meta.holdId);
     throw err;
   } finally {
     client.release();
   }
+
+  // ---- Step 5: Redis — FINALIZING → BOOKED (persists forever) ----
+  await confirmSeats(meta.eventId, meta.seatIds);
+
+  // Broadcast SEAT_BOOKED to all connected clients
+  const { broadcastMultiSeatUpdate } = require('../ws/seatBroadcast');
+  broadcastMultiSeatUpdate(meta.eventId, 'SEAT_BOOKED', meta.seatIds);
+
+  // Cleanup Redis metadata
+  await redis.del(`order_meta:${orderId}`);
+  await redis.del(`payment_timer:${meta.sessionId}`);
+
+  return getConfirmedOrderDetails(orderId);
 }
 
 
 // ============================================================
-// failOrder(orderId, customerId)
+// failOrder(orderId, userId)
 // ============================================================
-// Called on payment failure. Releases seat holds.
+// Called on payment failure. Releases Redis holds and marks
+// the order as FAILED.
 // ============================================================
-async function failOrder(orderId, customerId) {
-  const client = await pool.connect();
+async function failOrder(orderId, userId) {
+  const metaRaw = await redis.get(`order_meta:${orderId}`);
 
-  try {
-    await client.query('BEGIN');
-
-    // Get order and items
-    const orderResult = await client.query(
-      `SELECT o.order_id, o.event_id, o.status
-       FROM orders o
-       WHERE o.order_id = $1 AND o.customer_id = $2`,
-      [orderId, customerId]
-    );
-
-    if (orderResult.rows.length === 0) {
-      throw new Error('Order not found');
-    }
-
-    const order = orderResult.rows[0];
-    if (order.status !== 'pending') {
-      throw new Error(`Order is already ${order.status}`);
-    }
-
-    // Get seat IDs for Redis cleanup
-    const itemsResult = await client.query(
-      `SELECT oi.seat_id FROM order_items oi WHERE oi.order_id = $1`,
-      [orderId]
-    );
-    const seatIds = itemsResult.rows.map(r => r.seat_id);
-
-    // Mark order as failed
-    await client.query(
-      `UPDATE orders SET status = 'failed', updated_at = now()
-       WHERE order_id = $1`,
-      [orderId]
-    );
-
-    await client.query('COMMIT');
-
-    // Release Redis locks
-    try {
-      const delPipeline = redis.pipeline();
-      for (const seatId of seatIds) {
-        delPipeline.del(`seat_lock:${order.event_id}:${seatId}`);
-      }
-      await delPipeline.exec();
-    } catch {
-      // Non-fatal — TTL will expire
-    }
-
-    return { orderId: order.order_id, status: 'failed' };
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
+  if (metaRaw) {
+    const meta = JSON.parse(metaRaw);
+    // Release Redis holds
+    await releaseSeats(meta.eventId, meta.seatIds, meta.holdId);
+    // Cleanup Redis
+    await redis.del(`order_meta:${orderId}`);
+    await redis.del(`payment_timer:${meta.sessionId}`);
   }
+
+  await pool.query(
+    `UPDATE orders SET status = 'failed', updated_at = now() WHERE order_id = $1 AND customer_id = $2`,
+    [orderId, userId]
+  );
+
+  return { orderId, status: 'failed' };
 }
 
 
 // ============================================================
-// getOrderById(orderId, customerId)
+// getConfirmedOrderDetails(orderId)
 // ============================================================
-async function getOrderById(orderId, customerId) {
-  const result = await pool.query(
+// Returns full order + ticket details for confirmed orders.
+// Used for idempotent responses and confirmation page.
+// ============================================================
+async function getConfirmedOrderDetails(orderId) {
+  const orderResult = await pool.query(
     `SELECT o.order_id, o.event_id, o.status, o.total_amount, o.created_at,
             e.event_name, v.venue_name
      FROM orders o
      JOIN events e ON o.event_id = e.event_id
      JOIN venues v ON e.venue_id = v.venue_id
-     WHERE o.order_id = $1 AND o.customer_id = $2`,
-    [orderId, customerId]
+     WHERE o.order_id = $1`,
+    [orderId]
   );
 
-  if (result.rows.length === 0) return null;
+  if (orderResult.rows.length === 0) {
+    throw new Error('Order not found');
+  }
 
-  const order = result.rows[0];
-
-  // Get tickets for this order
-  const ticketsResult = await pool.query(
-    `SELECT t.ticket_id, t.price, t.qr_code, t.checked_in,
+  const ticketResult = await pool.query(
+    `SELECT t.ticket_id, t.seat_id, t.price, t.qr_code,
             s.section, s.row_label, s.seat_number
      FROM tickets t
      JOIN seats s ON t.seat_id = s.seat_id
-     WHERE t.order_id = $1
-     ORDER BY s.section, s.row_label, s.seat_number`,
+     WHERE t.order_id = $1`,
     [orderId]
   );
 
   return {
-    orderId: order.order_id,
-    eventId: order.event_id,
-    eventName: order.event_name,
-    venueName: order.venue_name,
-    status: order.status,
-    totalAmount: parseFloat(order.total_amount),
-    createdAt: order.created_at,
-    tickets: ticketsResult.rows.map(t => ({
+    orderId: orderResult.rows[0].order_id,
+    eventId: orderResult.rows[0].event_id,
+    eventName: orderResult.rows[0].event_name,
+    venueName: orderResult.rows[0].venue_name,
+    status: orderResult.rows[0].status,
+    totalAmount: parseFloat(orderResult.rows[0].total_amount),
+    createdAt: orderResult.rows[0].created_at,
+    tickets: ticketResult.rows.map(t => ({
       ticketId: t.ticket_id,
+      seatId: t.seat_id,
       section: t.section,
       row: t.row_label,
       seatNumber: t.seat_number,
       price: parseFloat(t.price),
       qrCode: t.qr_code,
-      checkedIn: t.checked_in,
     })),
   };
 }
 
 
-module.exports = { createOrder, confirmOrder, failOrder, getOrderById };
+// ============================================================
+// getOrderById(orderId, userId)
+// ============================================================
+async function getOrderById(orderId, userId) {
+  const result = await pool.query(
+    `SELECT o.*, e.event_name
+     FROM orders o
+     JOIN events e ON o.event_id = e.event_id
+     WHERE o.order_id = $1 AND o.customer_id = $2`,
+    [orderId, userId]
+  );
+
+  if (result.rows.length === 0) return null;
+
+  const row = result.rows[0];
+  return {
+    orderId: row.order_id,
+    eventId: row.event_id,
+    eventName: row.event_name,
+    status: row.status,
+    totalAmount: parseFloat(row.total_amount),
+  };
+}
+
+
+module.exports = {
+  createOrder,
+  confirmOrder,
+  failOrder,
+  getConfirmedOrderDetails,
+  getOrderById,
+};

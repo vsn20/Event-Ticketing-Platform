@@ -16,6 +16,8 @@
 
 const { generateSeatsForEvent, updateSectionPrice } = require('../service/seatService');
 const { createEvent, getAllEvents, getEventById, updateEvent } = require('../service/eventService');
+const { initializeEventSeats } = require('../service/redisInventoryService');
+const pool = require('../config/db');
 
 
 // ============================================================
@@ -64,6 +66,16 @@ async function publishEvent(req, res) {
     }
 
     const result = await generateSeatsForEvent(eventId, sectionPricing);
+
+    // ---- Initialize Redis seat inventory ----
+    // After seats are created in PostgreSQL, populate Redis
+    // with the initial AVAILABLE/BOOKED state for every seat.
+    const allSeats = await pool.query(
+      `SELECT seat_id, status FROM seats WHERE event_id = $1`,
+      [eventId]
+    );
+    await initializeEventSeats(eventId, allSeats.rows);
+
     res.json({
       message: 'Event published and seats generated',
       seatsCreated: result.seatsCreated,

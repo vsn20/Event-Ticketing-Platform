@@ -1,173 +1,334 @@
 // ============================================================
-// Seat Map Page — /events/[id]/seats
+// Seat Selection Page — /events/[id]/seats
 //
-// Interactive seat selection with section-first layout:
-//   1. Shows a mini stadium overview with sections as blocks
-//   2. Tap a section → expands to show individual seat grid
-//   3. Seat colors: white=available, grey=booked, blue=selected
-//   4. Bottom bar shows selected count + total + "Proceed" button
-//   5. "Proceed" locks seats in Redis (5 min) → redirects to checkout
+// Architecture-compliant seat map with:
+//   - 10-minute selection timer (server-enforced via session TTL)
+//   - Per-seat Redis acquisition (click → backend → Lua atomic)
+//   - Optimistic UI with rollback on failure
+//   - Section-first layout (tap section → see seats)
+//   - holdId-based display (your seats = blue, others = grey)
 //
-// API calls:
-//   GET  /api/events/:eventId/seats      → fetch seat map
-//   POST /api/events/:eventId/seats/lock → lock selected seats
+// FLOW:
+//   1. On mount: create booking session → get sessionId + holdId
+//   2. Load seat map: GET /events/:id/seats?holdId=H123
+//   3. Click seat: POST /booking-sessions/:sid/seats/:seatId
+//   4. Click again: DELETE /booking-sessions/:sid/seats/:seatId
+//   5. Proceed: POST /booking-sessions/:sid/proceed
+//      → stores checkout data in sessionStorage → redirect to /checkout
+//
+// Timer: frontend displays countdown (10 min).
+// Server enforces via session TTL + Redis seat TTL.
+// On expiry: redirect to event page.
 // ============================================================
 
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
 
-export default function SeatMapPage() {
+export default function SeatSelectionPage() {
   const params = useParams();
   const router = useRouter();
   const { user, loading: authLoading } = useAuth();
   const eventId = params.id;
 
-  // Data
-  const [event, setEvent] = useState(null);
-  const [sections, setSections] = useState([]);
-  const [selectedSeats, setSelectedSeats] = useState([]); // [{seat_id, section, row, seatNumber, price}]
-  const [expandedSection, setExpandedSection] = useState(null);
-
-  // UI
+  // --- State ---
+  const [session, setSession] = useState(null);    // { sessionId, holdId, ttl }
+  const [seats, setSeats] = useState([]);           // all seats with state
+  const [sections, setSections] = useState([]);     // unique section names
+  const [activeSection, setActiveSection] = useState(null);
+  const [selectedSeats, setSelectedSeats] = useState([]); // seat IDs selected by user
   const [loading, setLoading] = useState(true);
-  const [locking, setLocking] = useState(false);
   const [error, setError] = useState('');
+  const [seatError, setSeatError] = useState('');   // per-seat acquisition error
+  const [timeLeft, setTimeLeft] = useState(600);    // 10 minutes
+  const [proceeding, setProceeding] = useState(false);
+  const timerRef = useRef(null);
+  const wsRef = useRef(null);
 
   // ----------------------------------------------------------
-  // Fetch event details and seat map
+  // WebSocket — real-time seat updates from other users
   // ----------------------------------------------------------
-  const fetchData = useCallback(async () => {
-    try {
-      setLoading(true);
-      const [eventData, seatData] = await Promise.all([
-        api.get(`/events/${eventId}`),
-        api.get(`/events/${eventId}/seats`),
-      ]);
-      setEvent(eventData);
-      setSections(seatData.sections || []);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, [eventId]);
-
   useEffect(() => {
-    if (!authLoading) fetchData();
-  }, [authLoading, fetchData]);
+    if (!session || !eventId) return;
+
+    const wsUrl = `ws://localhost:5000/ws?eventId=${eventId}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'SEAT_HELD') {
+          // Another user held a seat — mark as unavailable (unless it's ours)
+          setSeats(prev => prev.map(s =>
+            s.seat_id === msg.seatId && s.state === 'AVAILABLE'
+              ? { ...s, state: 'HELD_BY_OTHER' }
+              : s
+          ));
+        } else if (msg.type === 'SEAT_AVAILABLE') {
+          // A seat was released — mark as available
+          setSeats(prev => prev.map(s =>
+            s.seat_id === msg.seatId && (s.state === 'HELD_BY_OTHER')
+              ? { ...s, state: 'AVAILABLE' }
+              : s
+          ));
+        } else if (msg.type === 'SEAT_BOOKED') {
+          // Seats permanently booked
+          const bookedIds = msg.seatIds || [msg.seatId];
+          setSeats(prev => prev.map(s =>
+            bookedIds.includes(s.seat_id) ? { ...s, state: 'BOOKED' } : s
+          ));
+        }
+      } catch {}
+    };
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [session, eventId]);
 
   // ----------------------------------------------------------
-  // Toggle seat selection
+  // 1. Reuse existing session or create new one
   // ----------------------------------------------------------
-  function toggleSeat(seat, sectionName, rowLabel, price) {
-    if (seat.status === 'sold' || (seat.status === 'held' && !seat.held_by_me)) {
-      return; // Can't select booked/held seats
+  // When the user navigates BACK from checkout, their session
+  // (and held seats) are still valid in Redis. We save the
+  // sessionId/holdId in sessionStorage so we can resume.
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (authLoading) return;
+
+    async function initSession() {
+      try {
+        // Check sessionStorage for an existing session for this event
+        const savedRaw = sessionStorage.getItem(`booking_session_${eventId}`);
+
+        if (savedRaw) {
+          const saved = JSON.parse(savedRaw);
+
+          // Validate the session is still alive on the backend
+          try {
+            const existing = await api.get(`/booking-sessions/${saved.sessionId}`);
+
+            if (existing && existing.ttlRemaining > 0) {
+              // Session still valid — reuse it
+              setSession({
+                sessionId: existing.sessionId || saved.sessionId,
+                holdId: existing.holdId,
+                ttl: existing.ttlRemaining,
+              });
+              setTimeLeft(existing.ttlRemaining);
+              await loadSeatMap(existing.holdId);
+              return; // done — no need to create new session
+            }
+          } catch {
+            // Session expired or invalid — clear and create new
+            sessionStorage.removeItem(`booking_session_${eventId}`);
+          }
+        }
+
+        // No valid session — create a new one
+        const sess = await api.post(`/events/${eventId}/booking-sessions`);
+        setSession(sess);
+        setTimeLeft(sess.ttl || 600);
+
+        // Save to sessionStorage for back-navigation
+        sessionStorage.setItem(`booking_session_${eventId}`, JSON.stringify({
+          sessionId: sess.sessionId,
+          holdId: sess.holdId,
+        }));
+
+        // Load seat map with holdId
+        await loadSeatMap(sess.holdId);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
     }
 
-    setSelectedSeats(prev => {
-      const exists = prev.find(s => s.seat_id === seat.seat_id);
-      if (exists) {
-        // Deselect
-        return prev.filter(s => s.seat_id !== seat.seat_id);
-      } else {
-        // Select (max 10)
-        if (prev.length >= 10) return prev;
-        return [...prev, {
-          seat_id: seat.seat_id,
-          section: sectionName,
-          row: rowLabel,
-          seatNumber: seat.seat_number,
-          price,
-        }];
-      }
-    });
+    initSession();
+
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [authLoading, eventId]);
+
+  // ----------------------------------------------------------
+  // 2. Countdown timer (10 min selection)
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (!session) return;
+
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current);
+          // Session expired — clean up and redirect
+          sessionStorage.removeItem(`booking_session_${eventId}`);
+          router.push(`/events/${eventId}`);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timerRef.current);
+  }, [session, eventId, router]);
+
+  // ----------------------------------------------------------
+  // Load seat map from backend
+  // ----------------------------------------------------------
+  async function loadSeatMap(holdId) {
+    const data = await api.get(`/events/${eventId}/seats?holdId=${holdId}`);
+    const seatList = data.seats || [];
+    setSeats(seatList);
+
+    // Extract unique sections
+    const uniqueSections = [...new Set(seatList.map(s => s.section))];
+    setSections(uniqueSections);
+    if (uniqueSections.length > 0 && !activeSection) {
+      setActiveSection(uniqueSections[0]);
+    }
+
+    // Track already-selected seats (HELD_BY_YOU)
+    const mySeats = seatList
+      .filter(s => s.state === 'HELD_BY_YOU')
+      .map(s => s.seat_id);
+    setSelectedSeats(mySeats);
   }
 
   // ----------------------------------------------------------
-  // Lock seats and proceed to checkout
+  // 3. Click seat — select or deselect
+  // ----------------------------------------------------------
+  const handleSeatClick = useCallback(async (seat) => {
+    if (!session) return;
+    setSeatError('');
+
+    const isSelected = selectedSeats.includes(seat.seat_id);
+
+    if (isSelected) {
+      // --- DESELECT ---
+      try {
+        await api.delete(`/booking-sessions/${session.sessionId}/seats/${seat.seat_id}`);
+        setSelectedSeats(prev => prev.filter(id => id !== seat.seat_id));
+        // Update seat state locally
+        setSeats(prev => prev.map(s =>
+          s.seat_id === seat.seat_id ? { ...s, state: 'AVAILABLE' } : s
+        ));
+      } catch (err) {
+        setSeatError(err.message);
+      }
+    } else {
+      // --- SELECT ---
+      if (selectedSeats.length >= 10) {
+        setSeatError('Maximum 10 seats per booking');
+        return;
+      }
+
+      // Optimistic UI — show blue immediately
+      setSeats(prev => prev.map(s =>
+        s.seat_id === seat.seat_id ? { ...s, state: 'HELD_BY_YOU' } : s
+      ));
+      setSelectedSeats(prev => [...prev, seat.seat_id]);
+
+      try {
+        await api.post(`/booking-sessions/${session.sessionId}/seats/${seat.seat_id}`);
+      } catch (err) {
+        // Rollback optimistic UI
+        setSeats(prev => prev.map(s =>
+          s.seat_id === seat.seat_id ? { ...s, state: 'HELD_BY_OTHER' } : s
+        ));
+        setSelectedSeats(prev => prev.filter(id => id !== seat.seat_id));
+        setSeatError(err.message || 'Seat unavailable');
+      }
+    }
+  }, [session, selectedSeats]);
+
+  // ----------------------------------------------------------
+  // 4. Proceed to payment
   // ----------------------------------------------------------
   async function handleProceed() {
-    if (selectedSeats.length === 0) return;
+    if (!session || selectedSeats.length === 0) return;
+    setProceeding(true);
+    setError('');
 
     try {
-      setLocking(true);
-      setError('');
+      const result = await api.post(`/booking-sessions/${session.sessionId}/proceed`);
 
-      const seatIds = selectedSeats.map(s => s.seat_id);
-      await api.post(`/events/${eventId}/seats/lock`, { seatIds });
-
-      // Store selected seats info in sessionStorage for checkout page
+      // Store checkout data for the checkout page
       sessionStorage.setItem('checkout_data', JSON.stringify({
-        eventId,
-        eventName: event?.event_name,
-        venueName: event?.venue_name,
-        seats: selectedSeats,
-        lockedAt: Date.now(),
+        sessionId: result.sessionId,
+        holdId: result.holdId,
+        eventId: result.eventId,
+        eventName: result.eventName,
+        venueName: result.venueName,
+        seats: result.seats,
+        totalAmount: result.totalAmount,
+        paymentTtl: result.paymentTtl,
+        paymentExpiresAt: result.paymentExpiresAt,
       }));
 
       router.push('/checkout');
     } catch (err) {
       setError(err.message);
-      // Refresh seat map to show updated status
-      fetchData();
-    } finally {
-      setLocking(false);
+      setProceeding(false);
     }
   }
 
   // ----------------------------------------------------------
-  // Helper: get seat color
+  // Format time as M:SS
+  // ----------------------------------------------------------
+  function formatTime(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  // ----------------------------------------------------------
+  // Get seat color/style based on state
   // ----------------------------------------------------------
   function getSeatStyle(seat) {
-    const isSelected = selectedSeats.some(s => s.seat_id === seat.seat_id);
-
-    if (isSelected || (seat.status === 'held' && seat.held_by_me)) {
-      return {
-        background: '#6366f1', // Indigo — selected by me
-        color: 'white',
-        cursor: 'pointer',
-        border: '2px solid #4f46e5',
-      };
+    switch (seat.state) {
+      case 'AVAILABLE':
+        return {
+          background: 'var(--bg-primary)',
+          border: '2px solid var(--border-primary)',
+          cursor: 'pointer',
+          color: 'var(--text-primary)',
+        };
+      case 'HELD_BY_YOU':
+        return {
+          background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+          border: '2px solid #6366f1',
+          cursor: 'pointer',
+          color: 'white',
+        };
+      case 'HELD_BY_OTHER':
+      case 'BOOKED':
+        return {
+          background: 'var(--bg-secondary)',
+          border: '2px solid transparent',
+          cursor: 'not-allowed',
+          color: 'var(--text-muted)',
+          opacity: 0.5,
+        };
+      default:
+        return {
+          background: 'var(--bg-secondary)',
+          border: '2px solid transparent',
+          cursor: 'not-allowed',
+          opacity: 0.5,
+        };
     }
-    if (seat.status === 'sold' || seat.status === 'held') {
-      return {
-        background: '#d1d5db', // Grey — booked/held by others
-        color: '#9ca3af',
-        cursor: 'not-allowed',
-        border: '2px solid #d1d5db',
-      };
-    }
-    return {
-      background: 'white', // White — available
-      color: '#374151',
-      cursor: 'pointer',
-      border: '2px solid #e5e7eb',
-    };
   }
-
-  // ----------------------------------------------------------
-  // Section stats
-  // ----------------------------------------------------------
-  function getSectionStats(section) {
-    let total = 0, available = 0;
-    for (const row of section.rows) {
-      for (const seat of row.seats) {
-        total++;
-        if (seat.status === 'available') available++;
-      }
-    }
-    return { total, available };
-  }
-
-  // ----------------------------------------------------------
-  // Total price
-  // ----------------------------------------------------------
-  const totalPrice = selectedSeats.reduce((sum, s) => sum + s.price, 0);
 
   // ----------------------------------------------------------
   // RENDER
@@ -175,167 +336,175 @@ export default function SeatMapPage() {
   if (loading) {
     return (
       <div className="page-container py-20 text-center">
-        <div className="spinner mx-auto mb-4" style={{ width: 40, height: 40 }}></div>
-        <p style={{ color: 'var(--text-muted)' }}>Loading seat map...</p>
+        <div className="spinner mx-auto mb-4" style={{ width: 48, height: 48 }}></div>
+        <p style={{ color: 'var(--text-muted)' }}>Setting up your booking session...</p>
       </div>
     );
   }
 
-  if (error && !sections.length) {
+  if (error && !session) {
     return (
       <div className="page-container py-20 text-center">
         <div className="text-5xl mb-4">😕</div>
-        <h2 className="text-xl font-semibold mb-2">Could not load seats</h2>
+        <h2 className="text-xl font-bold mb-2">Cannot start booking</h2>
         <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>{error}</p>
-        <Link href={`/events/${eventId}`} className="btn-primary no-underline">Back to Event</Link>
+        <Link href={`/events/${eventId}`} className="btn-primary no-underline">
+          Back to Event
+        </Link>
       </div>
     );
   }
 
+  const selectedSeatDetails = seats.filter(s => selectedSeats.includes(s.seat_id));
+  const totalPrice = selectedSeatDetails.reduce((sum, s) => sum + s.price, 0);
+  const isExpired = timeLeft <= 0;
+  const filteredSeats = seats.filter(s => s.section === activeSection);
+
+  // Group filtered seats by row
+  const rows = {};
+  filteredSeats.forEach(s => {
+    if (!rows[s.row_label]) rows[s.row_label] = [];
+    rows[s.row_label].push(s);
+  });
+  // Sort seats within each row
+  Object.values(rows).forEach(row => row.sort((a, b) => a.seat_number - b.seat_number));
+
   return (
-    <div className="page-container py-8 animate-fade-in" style={{ paddingBottom: selectedSeats.length > 0 ? 120 : 32 }}>
+    <div className="page-container py-6 animate-fade-in">
 
-      {/* ---- Header ---- */}
-      <Link href={`/events/${eventId}`} className="text-sm no-underline mb-4 inline-block"
-            style={{ color: 'var(--text-secondary)' }}>
-        ← Back to Event
-      </Link>
+      {/* ---- Header + Timer ---- */}
+      <div className="flex items-center justify-between mb-6">
+        <Link href={`/events/${eventId}`}
+              className="text-sm no-underline"
+              style={{ color: 'var(--text-secondary)' }}>
+          ← Back to Event
+        </Link>
 
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold mb-1">{event?.event_name}</h1>
-        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-          {event?.venue_name} · Select your seats
-        </p>
-      </div>
-
-      {error && <div className="error-message mb-4">{error}</div>}
-
-      {/* ---- Stage Label ---- */}
-      <div className="text-center mb-6">
-        <div className="inline-block px-12 py-3 rounded-xl text-sm font-bold tracking-widest"
-          style={{
-            background: 'linear-gradient(135deg, #1e1b4b, #312e81)',
-            color: 'white',
-            boxShadow: '0 4px 20px rgba(99, 102, 241, 0.3)',
-          }}>
-          🎭 STAGE
+        <div className="flex items-center gap-3">
+          <div className="px-4 py-2 rounded-xl font-mono font-bold text-lg"
+            style={{
+              background: isExpired
+                ? 'linear-gradient(135deg, #ef4444, #dc2626)'
+                : timeLeft < 60
+                  ? 'linear-gradient(135deg, #f59e0b, #d97706)'
+                  : 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+              color: 'white',
+            }}>
+            ⏱️ {formatTime(timeLeft)}
+          </div>
         </div>
       </div>
 
-      {/* ---- Section Blocks ---- */}
-      <div className="flex flex-col gap-4 max-w-2xl mx-auto mb-8">
-        {sections.map(section => {
-          const stats = getSectionStats(section);
-          const isExpanded = expandedSection === section.name;
+      <h1 className="text-2xl font-bold mb-4">Select Your Seats</h1>
 
-          return (
-            <div key={section.name}>
-              {/* Section Header Block */}
-              <button
-                onClick={() => setExpandedSection(isExpanded ? null : section.name)}
-                className="w-full p-4 rounded-xl transition-all"
-                style={{
-                  background: isExpanded
-                    ? 'linear-gradient(135deg, #6366f1, #8b5cf6)'
-                    : 'var(--bg-surface)',
-                  color: isExpanded ? 'white' : 'var(--text-primary)',
-                  border: `2px solid ${isExpanded ? '#6366f1' : 'var(--border-color)'}`,
-                  cursor: 'pointer',
-                  textAlign: 'left',
-                }}
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="font-bold text-lg">{section.name}</div>
-                    <div className="text-sm mt-1" style={{ opacity: 0.8 }}>
-                      ₹{section.price.toLocaleString()} · {stats.available}/{stats.total} available
-                    </div>
-                  </div>
-                  <div className="text-2xl">
-                    {isExpanded ? '▼' : '▶'}
-                  </div>
-                </div>
-              </button>
+      {error && <div className="error-message mb-4">{error}</div>}
+      {seatError && (
+        <div className="p-3 rounded-lg mb-4 text-sm"
+          style={{ background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.2)' }}>
+          {seatError}
+        </div>
+      )}
 
-              {/* Expanded Seat Grid */}
-              {isExpanded && (
-                <div className="mt-2 p-4 rounded-xl overflow-x-auto"
-                  style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-color)' }}>
-
-                  {section.rows.map(row => (
-                    <div key={row.label} className="flex items-center gap-2 mb-2">
-                      {/* Row Label */}
-                      <div className="w-8 text-xs font-bold text-center flex-shrink-0"
-                        style={{ color: 'var(--text-muted)' }}>
-                        {row.label}
-                      </div>
-
-                      {/* Seats */}
-                      <div className="flex gap-1.5 flex-wrap">
-                        {row.seats.map(seat => (
-                          <button
-                            key={seat.seat_id}
-                            onClick={() => toggleSeat(seat, section.name, row.label, section.price)}
-                            className="w-9 h-9 rounded-lg text-xs font-bold flex items-center justify-center transition-all"
-                            style={getSeatStyle(seat)}
-                            title={`${section.name} ${row.label}-${seat.seat_number}`}
-                            disabled={seat.status === 'sold' || (seat.status === 'held' && !seat.held_by_me)}
-                          >
-                            {seat.seat_number}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-
-                  {/* Legend */}
-                  <div className="flex gap-4 mt-4 pt-3 text-xs"
-                    style={{ borderTop: '1px solid var(--border-color)', color: 'var(--text-muted)' }}>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-4 h-4 rounded" style={{ background: 'white', border: '2px solid #e5e7eb' }}></div>
-                      Available
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-4 h-4 rounded" style={{ background: '#6366f1' }}></div>
-                      Selected
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-4 h-4 rounded" style={{ background: '#d1d5db' }}></div>
-                      Booked
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
+      {/* ---- Legend ---- */}
+      <div className="flex items-center gap-4 mb-6 text-xs flex-wrap">
+        <div className="flex items-center gap-1.5">
+          <div className="w-4 h-4 rounded" style={{ border: '2px solid var(--border-primary)' }}></div>
+          <span>Available</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className="w-4 h-4 rounded" style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}></div>
+          <span>Your Selection</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className="w-4 h-4 rounded" style={{ background: 'var(--bg-secondary)', opacity: 0.5 }}></div>
+          <span>Unavailable</span>
+        </div>
       </div>
 
-      {/* ---- Bottom Selection Bar ---- */}
-      {selectedSeats.length > 0 && (
-        <div className="fixed bottom-0 left-0 right-0 z-50 p-4"
-          style={{
-            background: 'var(--bg-surface)',
-            borderTop: '2px solid var(--border-color)',
-            boxShadow: '0 -4px 20px rgba(0,0,0,0.1)',
-          }}>
-          <div className="max-w-2xl mx-auto flex items-center justify-between">
-            <div>
-              <div className="font-bold">
-                🎫 {selectedSeats.length} seat{selectedSeats.length > 1 ? 's' : ''} selected
-              </div>
-              <div className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                Total: ₹{totalPrice.toLocaleString()}
-              </div>
+      {/* ---- Section Tabs ---- */}
+      <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
+        {sections.map(section => (
+          <button key={section}
+            onClick={() => setActiveSection(section)}
+            className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${
+              activeSection === section ? 'text-white' : ''
+            }`}
+            style={{
+              background: activeSection === section
+                ? 'linear-gradient(135deg, #6366f1, #8b5cf6)'
+                : 'var(--bg-secondary)',
+              color: activeSection === section ? 'white' : 'var(--text-primary)',
+            }}>
+            {section}
+          </button>
+        ))}
+      </div>
+
+      {/* ---- Stage Indicator ---- */}
+      <div className="text-center mb-6 py-2 px-6 rounded-lg text-xs font-bold uppercase"
+        style={{
+          background: 'var(--bg-secondary)',
+          color: 'var(--text-muted)',
+          letterSpacing: '0.2em',
+        }}>
+        ◆ STAGE ◆
+      </div>
+
+      {/* ---- Seat Grid ---- */}
+      <div className="mb-8">
+        {Object.entries(rows).map(([rowLabel, rowSeats]) => (
+          <div key={rowLabel} className="flex items-center gap-2 mb-2">
+            <span className="w-8 text-xs font-bold text-right"
+              style={{ color: 'var(--text-muted)' }}>
+              {rowLabel}
+            </span>
+            <div className="flex gap-1.5 flex-wrap">
+              {rowSeats.map(seat => (
+                <button key={seat.seat_id}
+                  onClick={() => {
+                    if (seat.state === 'AVAILABLE' || seat.state === 'HELD_BY_YOU') {
+                      handleSeatClick(seat);
+                    }
+                  }}
+                  disabled={seat.state === 'BOOKED' || seat.state === 'HELD_BY_OTHER' || isExpired}
+                  className="w-9 h-9 rounded text-xs font-medium transition-all hover:scale-110"
+                  style={getSeatStyle(seat)}
+                  title={`${seat.section} Row ${seat.row_label} Seat ${seat.seat_number} — ₹${seat.price}`}
+                >
+                  {seat.seat_number}
+                </button>
+              ))}
             </div>
-            <button
-              onClick={handleProceed}
-              disabled={locking}
-              className="btn-primary px-6 py-3 font-bold"
-            >
-              {locking ? 'Locking seats...' : 'Proceed to Payment →'}
-            </button>
           </div>
+        ))}
+      </div>
+
+      {/* ---- Selection Summary + Proceed ---- */}
+      {selectedSeats.length > 0 && (
+        <div className="card p-5 sticky bottom-4"
+          style={{
+            background: 'var(--bg-primary)',
+            boxShadow: '0 -4px 20px rgba(0,0,0,0.2)',
+          }}>
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <span className="font-bold">{selectedSeats.length} seat{selectedSeats.length > 1 ? 's' : ''}</span>
+              <span className="text-sm ml-2" style={{ color: 'var(--text-secondary)' }}>
+                {selectedSeatDetails.map(s => `${s.section} ${s.row_label}${s.seat_number}`).join(', ')}
+              </span>
+            </div>
+            <span className="text-xl font-bold" style={{ color: 'var(--color-primary)' }}>
+              ₹{totalPrice.toLocaleString()}
+            </span>
+          </div>
+
+          <button
+            onClick={handleProceed}
+            disabled={proceeding || isExpired}
+            className="btn-primary w-full py-3 font-bold text-base"
+          >
+            {proceeding ? 'Processing...' : `Proceed to Payment →`}
+          </button>
         </div>
       )}
     </div>

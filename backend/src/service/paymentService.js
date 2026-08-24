@@ -85,6 +85,11 @@ function verifyPayment(razorpayOrderId, razorpayPaymentId, razorpaySignature) {
     return true;
   }
 
+  // If order was created in mock mode, skip real verification
+  if (razorpayOrderId && razorpayOrderId.startsWith('mock_')) {
+    return true;
+  }
+
   const body = razorpayOrderId + '|' + razorpayPaymentId;
   const expectedSignature = crypto
     .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)

@@ -98,10 +98,17 @@ app.use('/api/venues', require('./src/routes/venueRoutes'));
 // listing/viewing is any authenticated user.
 app.use('/api/events', require('./src/routes/eventRoutes'));
 
-// Seat routes — nested under events (seat map + locking).
-// GET /api/events/:eventId/seats    → seat map with real-time status
-// POST /api/events/:eventId/seats/lock → lock seats in Redis
+// Seat routes — nested under events (Redis-only seat map reads).
+// GET /api/events/:eventId/seats → seat map with real-time state from Redis
 app.use('/api/events/:eventId/seats', require('./src/routes/seatRoutes'));
+
+// Booking session routes — seat selection + acquisition.
+// POST   /api/events/:eventId/booking-sessions         → create session
+// POST   /api/booking-sessions/:sessionId/seats/:seatId → select seat (Redis Lua)
+// DELETE /api/booking-sessions/:sessionId/seats/:seatId → deselect seat
+// POST   /api/booking-sessions/:sessionId/proceed       → proceed to payment
+// GET    /api/booking-sessions/:sessionId               → session status
+app.use('/api', require('./src/routes/bookingSessionRoutes'));
 
 // Waiting room routes — queue management for high-demand events.
 // POST /api/events/:eventId/waiting-room/join → try to get admitted
@@ -109,9 +116,9 @@ app.use('/api/events/:eventId/seats', require('./src/routes/seatRoutes'));
 // POST /api/events/:eventId/waiting-room/release → free up slot
 app.use('/api/events/:eventId/waiting-room', require('./src/routes/waitingRoomRoutes'));
 
-// Order routes — create order, process payment, get order details.
-// POST /api/orders → create from locked seats
-// POST /api/orders/:orderId/pay → pay + confirm
+// Order routes — create order + Razorpay, verify payment + finalize.
+// POST /api/orders → create order + Razorpay order
+// POST /api/orders/:orderId/pay → verify + Lua finalize + PG TX + confirm
 app.use('/api/orders', require('./src/routes/orderRoutes'));
 
 // Ticket routes — retrieve customer's tickets with QR codes.
@@ -121,10 +128,14 @@ app.use('/api/tickets', require('./src/routes/ticketRoutes'));
 
 
 // ============================================================
-// START SERVER
+// START SERVER + WebSocket
 // ============================================================
+const { initWebSocket } = require('./src/ws/seatBroadcast');
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+// Attach WebSocket server to the same HTTP server
+initWebSocket(server);

@@ -1,8 +1,8 @@
 // ============================================================
 // Checkout Page — /checkout
 //
-// Shows order summary with a 5-minute countdown timer.
-// "Pay Now" opens the Razorpay checkout modal.
+// Shows order summary with a 5-minute PAYMENT timer.
+// "Pay Now" creates the order + opens Razorpay checkout modal.
 //
 // On payment success → redirect to /confirmation/:orderId
 // On timeout (5 min) → redirect back to /events/:eventId
@@ -23,28 +23,24 @@ export default function CheckoutPage() {
   const { user, loading: authLoading } = useAuth();
 
   const [checkoutData, setCheckoutData] = useState(null);
-  const [order, setOrder] = useState(null); // includes razorpayOrderId
+  const [order, setOrder] = useState(null);
   const [paying, setPaying] = useState(false);
   const [error, setError] = useState('');
-  const [timeLeft, setTimeLeft] = useState(300); // 5 minutes
+  const [timeLeft, setTimeLeft] = useState(300); // 5 min payment timer
   const timerRef = useRef(null);
   const razorpayLoaded = useRef(false);
+  const redirectedRef = useRef(false);
 
   // ----------------------------------------------------------
   // Load Razorpay checkout script
   // ----------------------------------------------------------
   useEffect(() => {
     if (razorpayLoaded.current) return;
-
     const script = document.createElement('script');
     script.src = 'https://checkout.razorpay.com/v1/checkout.js';
     script.async = true;
     script.onload = () => { razorpayLoaded.current = true; };
     document.body.appendChild(script);
-
-    return () => {
-      // Don't remove — it's fine to keep loaded
-    };
   }, []);
 
   // ----------------------------------------------------------
@@ -60,21 +56,16 @@ export default function CheckoutPage() {
     const data = JSON.parse(raw);
     setCheckoutData(data);
 
-    // Calculate remaining lock time
-    const elapsed = Math.floor((Date.now() - data.lockedAt) / 1000);
-    const remaining = Math.max(0, 300 - elapsed);
-    setTimeLeft(remaining);
+    // Calculate remaining payment time
+    if (data.paymentExpiresAt) {
+      const remaining = Math.max(0, Math.floor((data.paymentExpiresAt - Date.now()) / 1000));
+      setTimeLeft(remaining);
 
-    if (remaining <= 0) {
-      setError('Your seat hold has expired.');
-      // Don't navigate here — the dedicated expiry effect below
-      // (watching `timeLeft`) handles ALL navigation-on-expiry,
-      // whether the countdown ran out live on this page or the
-      // customer arrived on an already-expired link. Having only
-      // one place that triggers this redirect avoids the two
-      // effects racing each other or double-navigating.
+      if (remaining <= 0) {
+        handleTimeout(data.eventId);
+      }
     }
-  }, [router]);
+  }, []);
 
   // ----------------------------------------------------------
   // Create order once we have checkout data
@@ -84,10 +75,11 @@ export default function CheckoutPage() {
 
     async function createOrder() {
       try {
-        const seatIds = checkoutData.seats.map(s => s.seat_id);
         const result = await api.post('/orders', {
+          sessionId: checkoutData.sessionId,
+          holdId: checkoutData.holdId,
           eventId: parseInt(checkoutData.eventId),
-          seatIds,
+          seatIds: checkoutData.seats.map(s => s.seat_id),
         });
         setOrder(result);
       } catch (err) {
@@ -99,78 +91,37 @@ export default function CheckoutPage() {
   }, [checkoutData, authLoading, order]);
 
   // ----------------------------------------------------------
-  // Countdown timer.
-  //
-  // IMPORTANT: this effect's setInterval callback does ONLY a
-  // pure state update — it just decrements the number. It does
-  // NOT call router.push, sessionStorage, or anything else with
-  // a side effect.
-  //
-  // WHY: the functional updater passed to setTimeLeft (the
-  // `prev => ...` function) can run during React's render/
-  // reconciliation phase, not strictly "after" it. Calling
-  // router.push() — which itself triggers a state update inside
-  // Next.js's Router component — from INSIDE that updater
-  // function means you're updating one component (Router) while
-  // React is in the middle of processing an update for another
-  // component (CheckoutPage). That's exactly what triggers the
-  // "Cannot update a component while rendering a different
-  // component" warning/error.
-  //
-  // THE FIX: keep the interval's job to ONE thing — decrementing
-  // a number. A separate effect below WATCHES timeLeft and reacts
-  // to it hitting 0 with the actual side effects (clearing
-  // storage, navigating away). Reacting to a state change in its
-  // own effect (after the render that produced it has fully
-  // committed) is the correct, safe place for side effects like
-  // navigation — as opposed to reacting inside the setState call
-  // that produced the change.
+  // 5-minute payment countdown
   // ----------------------------------------------------------
   useEffect(() => {
-    if (timeLeft <= 0) return;
+    if (timeLeft <= 0 || !checkoutData) return;
 
     timerRef.current = setInterval(() => {
-      // Pure — just clamps at 0, no side effects of any kind here.
-      setTimeLeft((prev) => Math.max(prev - 1, 0));
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current);
+          handleTimeout(checkoutData.eventId);
+          return 0;
+        }
+        return prev - 1;
+      });
     }, 1000);
 
     return () => clearInterval(timerRef.current);
-    // Only re-run when checkoutData/router identity changes (e.g.
-    // on first load) — NOT on every timeLeft tick, otherwise we'd
-    // tear down and rebuild the interval every single second.
-  }, [checkoutData, router]);
+  }, [checkoutData]);
 
   // ----------------------------------------------------------
-  // Expiry side effect — reacts to timeLeft reaching 0.
-  //
-  // This is the ONLY place in this component that navigates away
-  // on expiry — whether the countdown ran out live on this page,
-  // or the customer loaded the checkout page on an already-
-  // expired link. Having a single source of truth for this avoids
-  // two different effects racing to both trigger a redirect.
-  //
-  // This runs as its own effect, AFTER the render that set
-  // timeLeft to 0 has fully committed — which is the correct,
-  // React-sanctioned place to trigger navigation in response to
-  // a state change, rather than from inside the setState updater
-  // that produced the change (see the countdown effect above for
-  // why that matters).
-  //
-  // A short 2-second delay gives the customer a moment to actually
-  // read the "seat hold expired" message before being redirected.
+  // Handle timeout — redirect to event page
   // ----------------------------------------------------------
-  useEffect(() => {
-    if (timeLeft !== 0 || !checkoutData) return;
-
-    clearInterval(timerRef.current);
-
-    const redirectTimeout = setTimeout(() => {
-      sessionStorage.removeItem('checkout_data');
-      router.push(`/events/${checkoutData.eventId}`);
-    }, 2000);
-
-    return () => clearTimeout(redirectTimeout);
-  }, [timeLeft, checkoutData, router]);
+  function handleTimeout(eventId) {
+    if (redirectedRef.current) return;
+    redirectedRef.current = true;
+    sessionStorage.removeItem('checkout_data');
+    // Use setTimeout to avoid React state-during-render issues
+    setTimeout(() => {
+      router.push(`/events/${eventId}`);
+    }, 0);
+  }
 
   // ----------------------------------------------------------
   // Format time as M:SS
@@ -182,7 +133,7 @@ export default function CheckoutPage() {
   }
 
   // ----------------------------------------------------------
-  // Open Razorpay checkout modal
+  // Open Razorpay checkout
   // ----------------------------------------------------------
   const handlePay = useCallback(() => {
     if (!order || paying) return;
@@ -190,7 +141,7 @@ export default function CheckoutPage() {
     setPaying(true);
     setError('');
 
-    // If mock mode (no Razorpay keys), simulate payment
+    // Mock mode (no Razorpay keys)
     if (order.mock) {
       handlePaymentSuccess({
         razorpay_order_id: order.razorpayOrderId,
@@ -202,13 +153,12 @@ export default function CheckoutPage() {
 
     const options = {
       key: order.razorpayKeyId,
-      amount: Math.round(order.totalAmount * 100), // paise
+      amount: Math.round(order.totalAmount * 100),
       currency: order.currency || 'INR',
       name: 'Event Ticketing',
       description: checkoutData?.eventName || 'Ticket Purchase',
       order_id: order.razorpayOrderId,
       handler: function (response) {
-        // Payment successful — verify on backend
         handlePaymentSuccess(response);
       },
       modal: {
@@ -220,9 +170,7 @@ export default function CheckoutPage() {
         name: user?.name || '',
         email: user?.email || '',
       },
-      theme: {
-        color: '#6366f1',
-      },
+      theme: { color: '#6366f1' },
     };
 
     const rzp = new window.Razorpay(options);
@@ -230,36 +178,7 @@ export default function CheckoutPage() {
   }, [order, paying, checkoutData, user]);
 
   // ----------------------------------------------------------
-  // Mark payment as completed — DEMO ONLY, skips Razorpay entirely.
-  //
-  // Calls POST /orders/:orderId/mock-pay directly, which confirms
-  // the order server-side without any real (or test-mode) payment
-  // gateway involved. This exists purely so this project can be
-  // demoed/graded without needing a funded Razorpay test account
-  // or anyone entering card details — see the comment on the
-  // backend route (orderRoutes.js) for the full reasoning.
-  // ----------------------------------------------------------
-  const handleMockPay = useCallback(async () => {
-    if (!order || paying) return;
-
-    setPaying(true);
-    setError('');
-
-    try {
-      await api.post(`/orders/${order.orderId}/mock-pay`);
-
-      sessionStorage.removeItem('checkout_data');
-      clearInterval(timerRef.current);
-
-      router.push(`/confirmation/${order.orderId}`);
-    } catch (err) {
-      setError(err.message);
-      setPaying(false);
-    }
-  }, [order, paying, router]);
-
-  // ----------------------------------------------------------
-  // Handle successful Razorpay payment
+  // Handle Razorpay payment success
   // ----------------------------------------------------------
   async function handlePaymentSuccess(response) {
     try {
@@ -269,11 +188,12 @@ export default function CheckoutPage() {
         razorpay_signature: response.razorpay_signature,
       });
 
-      // Clear checkout data
       sessionStorage.removeItem('checkout_data');
+      // Also clean up the booking session reference
+      if (checkoutData?.eventId) {
+        sessionStorage.removeItem(`booking_session_${checkoutData.eventId}`);
+      }
       clearInterval(timerRef.current);
-
-      // Redirect to confirmation page
       router.push(`/confirmation/${order.orderId}`);
     } catch (err) {
       setError(err.message);
@@ -293,7 +213,7 @@ export default function CheckoutPage() {
     );
   }
 
-  const totalPrice = checkoutData?.seats?.reduce((sum, s) => sum + s.price, 0) || 0;
+  const totalPrice = checkoutData?.totalAmount || 0;
   const isExpired = timeLeft <= 0;
 
   return (
@@ -307,7 +227,7 @@ export default function CheckoutPage() {
 
       <h1 className="text-2xl font-bold mb-6">Checkout</h1>
 
-      {/* ---- Timer ---- */}
+      {/* ---- Payment Timer ---- */}
       <div className="p-4 rounded-xl mb-6 text-center"
         style={{
           background: isExpired
@@ -318,7 +238,7 @@ export default function CheckoutPage() {
           color: 'white',
         }}>
         <div className="text-sm mb-1">
-          {isExpired ? '⏰ Seat hold expired — redirecting...' : '⏱️ Seats held for'}
+          {isExpired ? '⏰ Payment timer expired — redirecting...' : '⏱️ Complete payment within'}
         </div>
         <div className="text-3xl font-bold font-mono">
           {isExpired ? '0:00' : formatTime(timeLeft)}
@@ -385,7 +305,7 @@ export default function CheckoutPage() {
                 Processing...
               </span>
             ) : isExpired ? (
-              '⏰ Session Expired — Redirecting...'
+              '⏰ Session Expired'
             ) : (
               `💳 Pay ₹${totalPrice.toLocaleString()} with Razorpay`
             )}
@@ -394,26 +314,6 @@ export default function CheckoutPage() {
           <p className="text-xs text-center mt-3" style={{ color: 'var(--text-muted)' }}>
             Secure payment powered by Razorpay
           </p>
-
-          {/* ---- Mock Payment Button (demo/portfolio only) ----
-              Skips Razorpay entirely — confirms the order directly.
-              Kept visually distinct (outline style, smaller) from
-              the real Pay button so it reads as a "dev shortcut,"
-              not the primary intended path. */}
-          <button
-            onClick={handleMockPay}
-            disabled={paying || isExpired || !order}
-            className="w-full py-3 mt-3 text-sm font-semibold rounded-xl"
-            style={{
-              background: 'transparent',
-              border: '1.5px dashed var(--color-primary)',
-              color: 'var(--color-primary)',
-              opacity: (paying || isExpired || !order) ? 0.5 : 1,
-              cursor: (paying || isExpired || !order) ? 'not-allowed' : 'pointer',
-            }}
-          >
-            {paying ? 'Processing...' : '✅ Mark Payment Completed (Demo — No Real Payment)'}
-          </button>
         </>
       )}
     </div>
