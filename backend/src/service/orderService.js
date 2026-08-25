@@ -269,14 +269,18 @@ async function confirmOrder(orderId, userId) {
 // ============================================================
 async function failOrder(orderId, userId) {
   const metaRaw = await redis.get(`order_meta:${orderId}`);
+  console.log(`🔴 failOrder(${orderId}): order_meta exists=${!!metaRaw}`);
 
   if (metaRaw) {
     const meta = JSON.parse(metaRaw);
+    console.log(`🔴 failOrder: holdId=${meta.holdId}, seatIds=${meta.seatIds}, eventId=${meta.eventId}`);
     // Release Redis holds
-    await releaseSeats(meta.eventId, meta.seatIds, meta.holdId);
+    const released = await releaseSeats(meta.eventId, meta.seatIds, meta.holdId);
+    console.log(`🔴 failOrder: releaseSeats returned ${released}`);
     // Cleanup Redis
     await redis.del(`order_meta:${orderId}`);
     await redis.del(`payment_timer:${meta.sessionId}`);
+    await redis.del(`session:${meta.sessionId}`); // Delete selection cache
   }
 
   await pool.query(

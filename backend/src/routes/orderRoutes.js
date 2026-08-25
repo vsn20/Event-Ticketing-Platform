@@ -12,7 +12,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate } = require('../middleware/authMiddleware');
-const { createOrder, confirmOrder, failOrder, getOrderById } = require('../service/orderService');
+const { createOrder, confirmOrder, failOrder, getOrderById, getConfirmedOrderDetails } = require('../service/orderService');
 const { createRazorpayOrder, verifyPayment } = require('../service/paymentService');
 const { releaseSlot } = require('../service/waitingRoomService');
 
@@ -125,6 +125,8 @@ router.post('/:orderId/pay', authenticate, async (req, res) => {
     // If finalization fails, try to fail the order cleanly
     try {
       await failOrder(parseInt(req.params.orderId), req.user.id);
+      const order = await getOrderById(parseInt(req.params.orderId), req.user.id);
+      if (order) await releaseSlot(order.event_id || order.eventId, req.user.id);
     } catch {}
 
     res.status(500).json({ message: err.message });
@@ -137,13 +139,117 @@ router.post('/:orderId/pay', authenticate, async (req, res) => {
 // ============================================================
 router.get('/:orderId', authenticate, async (req, res) => {
   try {
+    // First check basic order info
     const order = await getOrderById(parseInt(req.params.orderId), req.user.id);
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
+
+    // For confirmed orders, return full details with tickets
+    if (order.status === 'confirmed') {
+      const fullOrder = await getConfirmedOrderDetails(parseInt(req.params.orderId));
+      return res.json(fullOrder);
+    }
+
     res.json(order);
   } catch (err) {
     console.error('Error fetching order:', err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+
+// ============================================================
+// POST /api/orders/:orderId/cancel
+// ============================================================
+// Called when the payment timer expires or user abandons.
+// Releases Redis holds (seats → AVAILABLE) and marks
+// the order as FAILED in PostgreSQL.
+// ============================================================
+router.post('/:orderId/cancel', authenticate, async (req, res) => {
+  try {
+    console.log(`🔴 CANCEL called for order ${req.params.orderId} by user ${req.user.id}`);
+    const result = await failOrder(parseInt(req.params.orderId), req.user.id);
+    console.log(`🔴 CANCEL failOrder result:`, result);
+
+    // Release waiting room slot
+    try {
+      const order = await getOrderById(parseInt(req.params.orderId), req.user.id);
+      if (order) await releaseSlot(order.event_id || order.eventId, req.user.id);
+    } catch {}
+
+    // Broadcast seat releases via WebSocket
+    try {
+      const { broadcastMultiSeatUpdate } = require('../ws/seatBroadcast');
+      const pool = require('../config/db');
+      const items = await pool.query(
+        `SELECT s.seat_id, o.event_id
+         FROM order_items oi
+         JOIN seats s ON oi.seat_id = s.seat_id
+         JOIN orders o ON oi.order_id = o.order_id
+         WHERE oi.order_id = $1`,
+        [parseInt(req.params.orderId)]
+      );
+      if (items.rows.length > 0) {
+        const eventId = items.rows[0].event_id;
+        const seatIds = items.rows.map(r => r.seat_id);
+        console.log(`🔴 CANCEL broadcasting SEAT_AVAILABLE for seats:`, seatIds, 'event:', eventId);
+        broadcastMultiSeatUpdate(eventId, 'SEAT_AVAILABLE', seatIds);
+      }
+    } catch {}
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error cancelling order:', err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ============================================================
+// POST /api/orders/:orderId/cancel-beacon
+// ============================================================
+// Same as /cancel but accepts JWT in the body instead of
+// the Authorization header. Used by navigator.sendBeacon()
+// which cannot set custom headers.
+// ============================================================
+router.post('/:orderId/cancel-beacon', async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (!token) return res.status(401).json({ message: 'No token' });
+
+    // Verify JWT manually
+    const jwt = require('jsonwebtoken');
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: 'Invalid token' });
+    }
+
+    const result = await failOrder(parseInt(req.params.orderId), decoded.userId);
+
+    // Broadcast seat releases via WebSocket
+    try {
+      const { broadcastMultiSeatUpdate } = require('../ws/seatBroadcast');
+      const pool = require('../config/db');
+      const items = await pool.query(
+        `SELECT s.seat_id, o.event_id
+         FROM order_items oi
+         JOIN seats s ON oi.seat_id = s.seat_id
+         JOIN orders o ON oi.order_id = o.order_id
+         WHERE oi.order_id = $1`,
+        [parseInt(req.params.orderId)]
+      );
+      if (items.rows.length > 0) {
+        const eventId = items.rows[0].event_id;
+        const seatIds = items.rows.map(r => r.seat_id);
+        broadcastMultiSeatUpdate(eventId, 'SEAT_AVAILABLE', seatIds);
+      }
+    } catch {}
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error cancelling order (beacon):', err);
     res.status(500).json({ message: err.message });
   }
 });

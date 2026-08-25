@@ -28,6 +28,7 @@ const {
 const {
   acquireSeats,
   releaseSeat,
+  releaseSeats,
   finalizeSeats,
   getSeatMap,
   PAYMENT_TTL,
@@ -114,8 +115,14 @@ router.post('/booking-sessions/:sessionId/seats/:seatId', authenticate, async (r
       return res.status(400).json({ message: 'Seat already selected' });
     }
 
-    // Atomic acquisition in Redis
-    const result = await acquireSeats(session.eventId, [parseInt(seatId)], session.holdId);
+    // Get remaining session TTL so the seat key expires at the same time
+    const sessionTtl = await redis.ttl(`session:${sessionId}`);
+    if (sessionTtl <= 0) {
+      return res.status(400).json({ message: 'Session expired' });
+    }
+
+    // Atomic acquisition in Redis — use session TTL so seat expires with session
+    const result = await acquireSeats(session.eventId, [parseInt(seatId)], session.holdId, sessionTtl);
 
     if (!result.success) {
       return res.status(409).json({ message: result.message });
@@ -284,6 +291,66 @@ router.get('/booking-sessions/:sessionId', authenticate, async (req, res) => {
     });
   } catch (err) {
     console.error('Error getting session:', err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ============================================================
+// DELETE /api/booking-sessions/:sessionId
+// ============================================================
+// Explicitly cancels a session, releasing all its held seats.
+// Used when:
+//   - The 10-minute selection timer expires on frontend
+//   - The user clicks "Back to Event"
+//
+// IMPORTANT: By the time the frontend timer hits 0, the Redis
+// session key has ALSO expired (same 600s TTL). So validateSession
+// will return false. That's why we accept holdId, eventId, and
+// seatIds in the body as a fallback — the frontend always has
+// this data from when the session was created.
+// ============================================================
+router.delete('/booking-sessions/:sessionId', authenticate, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    // Try to get session from Redis first
+    const { valid, session } = await validateSession(sessionId, req.user.id);
+
+    // Use session data if available, otherwise fall back to body params
+    const holdId = session?.holdId || req.body?.holdId;
+    const eventId = session?.eventId || req.body?.eventId;
+    const seatIds = (session?.selectedSeats?.length > 0)
+      ? session.selectedSeats
+      : (req.body?.seatIds || []);
+
+    if (!holdId || !eventId) {
+      // No session and no fallback data — nothing we can do
+      return res.status(200).json({ success: true, message: 'Already cleaned up' });
+    }
+
+    // Release seats from Redis
+    if (seatIds.length > 0) {
+      await releaseSeats(eventId, seatIds, holdId);
+
+      // Broadcast release via WebSocket
+      try {
+        const { broadcastMultiSeatUpdate } = require('../ws/seatBroadcast');
+        broadcastMultiSeatUpdate(eventId, 'SEAT_AVAILABLE', seatIds);
+      } catch {}
+    }
+
+    // Delete session key (if it still exists)
+    await redis.del(`session:${sessionId}`);
+
+    // Release waiting room slot
+    try {
+      const { releaseSlot } = require('../service/waitingRoomService');
+      await releaseSlot(eventId, req.user.id);
+    } catch {}
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting session:', err);
     res.status(500).json({ message: err.message });
   }
 });

@@ -25,7 +25,6 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import Link from 'next/link';
 import { useAuth } from '@/app/context/AuthContext';
 import api from '@/app/lib/api';
 
@@ -48,6 +47,8 @@ export default function SeatSelectionPage() {
   const [proceeding, setProceeding] = useState(false);
   const timerRef = useRef(null);
   const wsRef = useRef(null);
+  const sessionRef = useRef(null); // always-current session for async callbacks
+  const expiredRef = useRef(false); // prevent double cleanup
 
   // ----------------------------------------------------------
   // WebSocket — real-time seat updates from other users
@@ -55,7 +56,8 @@ export default function SeatSelectionPage() {
   useEffect(() => {
     if (!session || !eventId) return;
 
-    const wsUrl = `ws://localhost:5000/ws?eventId=${eventId}`;
+    const wsBase = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:5000';
+    const wsUrl = `${wsBase}/ws?eventId=${eventId}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -64,19 +66,23 @@ export default function SeatSelectionPage() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === 'SEAT_HELD') {
+          const heldIds = msg.seatIds || [msg.seatId];
           // Another user held a seat — mark as unavailable (unless it's ours)
           setSeats(prev => prev.map(s =>
-            s.seat_id === msg.seatId && s.state === 'AVAILABLE'
+            heldIds.includes(s.seat_id) && s.state === 'AVAILABLE'
               ? { ...s, state: 'HELD_BY_OTHER' }
               : s
           ));
         } else if (msg.type === 'SEAT_AVAILABLE') {
-          // A seat was released — mark as available
+          const availIds = msg.seatIds || [msg.seatId];
+          // A seat was released — mark as available (any non-BOOKED state)
           setSeats(prev => prev.map(s =>
-            s.seat_id === msg.seatId && (s.state === 'HELD_BY_OTHER')
+            availIds.includes(s.seat_id) && s.state !== 'BOOKED' && s.state !== 'AVAILABLE'
               ? { ...s, state: 'AVAILABLE' }
               : s
           ));
+          // Also remove from our selected list if they were ours
+          setSelectedSeats(prev => prev.filter(id => !availIds.includes(id)));
         } else if (msg.type === 'SEAT_BOOKED') {
           // Seats permanently booked
           const bookedIds = msg.seatIds || [msg.seatId];
@@ -119,11 +125,13 @@ export default function SeatSelectionPage() {
 
             if (existing && existing.ttlRemaining > 0) {
               // Session still valid — reuse it
-              setSession({
+              const resumedSession = {
                 sessionId: existing.sessionId || saved.sessionId,
                 holdId: existing.holdId,
                 ttl: existing.ttlRemaining,
-              });
+              };
+              setSession(resumedSession);
+              sessionRef.current = resumedSession;
               setTimeLeft(existing.ttlRemaining);
               await loadSeatMap(existing.holdId);
               return; // done — no need to create new session
@@ -137,6 +145,7 @@ export default function SeatSelectionPage() {
         // No valid session — create a new one
         const sess = await api.post(`/events/${eventId}/booking-sessions`);
         setSession(sess);
+        sessionRef.current = sess;
         setTimeLeft(sess.ttl || 600);
 
         // Save to sessionStorage for back-navigation
@@ -171,9 +180,6 @@ export default function SeatSelectionPage() {
       setTimeLeft(prev => {
         if (prev <= 1) {
           clearInterval(timerRef.current);
-          // Session expired — clean up and redirect
-          sessionStorage.removeItem(`booking_session_${eventId}`);
-          router.push(`/events/${eventId}`);
           return 0;
         }
         return prev - 1;
@@ -181,7 +187,31 @@ export default function SeatSelectionPage() {
     }, 1000);
 
     return () => clearInterval(timerRef.current);
-  }, [session, eventId, router]);
+  }, [session]);
+
+  // ----------------------------------------------------------
+  // 2b. Handle session expiry (fires once when timeLeft hits 0)
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (timeLeft !== 0 || !sessionRef.current || expiredRef.current) return;
+    expiredRef.current = true;
+
+    const sess = sessionRef.current;
+
+    // Tell backend to release seats + broadcast via WebSocket
+    // Pass holdId/eventId/seatIds in body as fallback since
+    // the Redis session key has the same 600s TTL and has likely
+    // already expired by now.
+    api.delete(`/booking-sessions/${sess.sessionId}`, {
+      holdId: sess.holdId,
+      eventId: eventId,
+      seatIds: selectedSeats,
+    }).catch(() => {});
+
+    // Clean up frontend state
+    sessionStorage.removeItem(`booking_session_${eventId}`);
+    router.push(`/events/${eventId}`);
+  }, [timeLeft, eventId, router]);
 
   // ----------------------------------------------------------
   // Load seat map from backend
@@ -284,6 +314,24 @@ export default function SeatSelectionPage() {
   }
 
   // ----------------------------------------------------------
+  // 5. Back to Event — clean up session completely
+  // ----------------------------------------------------------
+  async function handleBackToEvent() {
+    // Release all held seats on backend + broadcast via WebSocket
+    if (session?.sessionId) {
+      try {
+        await api.delete(`/booking-sessions/${session.sessionId}`, {
+          holdId: session.holdId,
+          eventId: eventId,
+          seatIds: selectedSeats,
+        });
+      } catch {}
+    }
+    sessionStorage.removeItem(`booking_session_${eventId}`);
+    router.push(`/events/${eventId}`);
+  }
+
+  // ----------------------------------------------------------
   // Format time as M:SS
   // ----------------------------------------------------------
   function formatTime(seconds) {
@@ -348,9 +396,9 @@ export default function SeatSelectionPage() {
         <div className="text-5xl mb-4">😕</div>
         <h2 className="text-xl font-bold mb-2">Cannot start booking</h2>
         <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>{error}</p>
-        <Link href={`/events/${eventId}`} className="btn-primary no-underline">
+        <a href={`/events/${eventId}`} className="btn-primary no-underline">
           Back to Event
-        </Link>
+        </a>
       </div>
     );
   }
@@ -374,11 +422,11 @@ export default function SeatSelectionPage() {
 
       {/* ---- Header + Timer ---- */}
       <div className="flex items-center justify-between mb-6">
-        <Link href={`/events/${eventId}`}
-              className="text-sm no-underline"
-              style={{ color: 'var(--text-secondary)' }}>
+        <button onClick={handleBackToEvent}
+              className="text-sm"
+              style={{ color: 'var(--text-secondary)', background: 'none', border: 'none', cursor: 'pointer' }}>
           ← Back to Event
-        </Link>
+        </button>
 
         <div className="flex items-center gap-3">
           <div className="px-4 py-2 rounded-xl font-mono font-bold text-lg"

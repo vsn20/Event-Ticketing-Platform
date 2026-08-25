@@ -30,6 +30,7 @@ export default function CheckoutPage() {
   const timerRef = useRef(null);
   const razorpayLoaded = useRef(false);
   const redirectedRef = useRef(false);
+  const orderRef = useRef(null); // always-current order for async callbacks
 
   // ----------------------------------------------------------
   // Load Razorpay checkout script
@@ -82,6 +83,7 @@ export default function CheckoutPage() {
           seatIds: checkoutData.seats.map(s => s.seat_id),
         });
         setOrder(result);
+        orderRef.current = result;
       } catch (err) {
         setError(err.message);
       }
@@ -111,17 +113,70 @@ export default function CheckoutPage() {
   }, [checkoutData]);
 
   // ----------------------------------------------------------
-  // Handle timeout — redirect to event page
+  // Handle timeout — cancel order + release seats + redirect
   // ----------------------------------------------------------
-  function handleTimeout(eventId) {
+  async function handleTimeout(eventId) {
     if (redirectedRef.current) return;
     redirectedRef.current = true;
+
+    // Cancel the order → releases Redis holds → seats become AVAILABLE
+    // Use orderRef (not order state) to avoid stale closure
+    const currentOrder = orderRef.current;
+    console.log('🔴 handleTimeout: orderRef.current =', currentOrder);
+    if (currentOrder?.orderId) {
+      try {
+        console.log('🔴 handleTimeout: calling cancel for order', currentOrder.orderId);
+        await api.post(`/orders/${currentOrder.orderId}/cancel`);
+        console.log('🔴 handleTimeout: cancel succeeded');
+      } catch (err) {
+        console.error('🔴 handleTimeout: cancel failed', err);
+      }
+    } else {
+      console.error('🔴 handleTimeout: NO ORDER to cancel! order state =', order);
+    }
+
     sessionStorage.removeItem('checkout_data');
-    // Use setTimeout to avoid React state-during-render issues
+    sessionStorage.removeItem(`booking_session_${eventId}`);
+
     setTimeout(() => {
       router.push(`/events/${eventId}`);
     }, 0);
   }
+
+  // ----------------------------------------------------------
+  // Cleanup on page leave (browser back, tab close, nav away)
+  // ----------------------------------------------------------
+  useEffect(() => {
+    const cleanup = () => {
+      // Use sendBeacon for reliable cleanup on tab close / nav away
+      const currentOrder = orderRef.current;
+      if (currentOrder?.orderId && !redirectedRef.current) {
+        const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+        navigator.sendBeacon(
+          `${apiBase}/orders/${currentOrder.orderId}/cancel-beacon`,
+          new Blob([JSON.stringify({ token })], { type: 'application/json' })
+        );
+      }
+    };
+
+    window.addEventListener('beforeunload', cleanup);
+
+    return () => {
+      window.removeEventListener('beforeunload', cleanup);
+      // On React unmount (e.g. navigating to another page via router)
+      const currentOrder = orderRef.current;
+      if (currentOrder?.orderId && !redirectedRef.current) {
+        redirectedRef.current = true;
+        api.post(`/orders/${currentOrder.orderId}/cancel`).catch(() => {});
+        if (checkoutData?.eventId) {
+          sessionStorage.removeItem('checkout_data');
+          sessionStorage.removeItem(`booking_session_${checkoutData.eventId}`);
+        }
+      }
+    };
+  }, []); // Empty deps — refs handle latest values. DO NOT add order/checkoutData
+          // or the cleanup will fire on re-render and cancel the order prematurely.
 
   // ----------------------------------------------------------
   // Format time as M:SS
@@ -189,12 +244,51 @@ export default function CheckoutPage() {
       });
 
       sessionStorage.removeItem('checkout_data');
-      // Also clean up the booking session reference
       if (checkoutData?.eventId) {
         sessionStorage.removeItem(`booking_session_${checkoutData.eventId}`);
       }
       clearInterval(timerRef.current);
       router.push(`/confirmation/${order.orderId}`);
+    } catch (err) {
+      setError(err.message);
+      setPaying(false);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Test Payment — auto-pay without Razorpay modal
+  // ----------------------------------------------------------
+  // Computes HMAC signature using the test secret and calls
+  // the pay endpoint directly. No real money charged.
+  // ----------------------------------------------------------
+  async function handleTestPayment() {
+    if (!order || paying) return;
+    setPaying(true);
+    setError('');
+
+    try {
+      // Use the Razorpay test secret to compute the signature
+      // (In production this would never be on the frontend)
+      const paymentId = `test_pay_${Date.now()}`;
+      const secret = 'KDcrhnaJwT8cNhW6IKICt9fX';
+
+      // Compute HMAC SHA256 signature
+      const encoder = new TextEncoder();
+      const keyData = encoder.encode(secret);
+      const msgData = encoder.encode(order.razorpayOrderId + '|' + paymentId);
+
+      const cryptoKey = await crypto.subtle.importKey(
+        'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+      const sigBuffer = await crypto.subtle.sign('HMAC', cryptoKey, msgData);
+      const sigHex = Array.from(new Uint8Array(sigBuffer))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+      await handlePaymentSuccess({
+        razorpay_order_id: order.razorpayOrderId,
+        razorpay_payment_id: paymentId,
+        razorpay_signature: sigHex,
+      });
     } catch (err) {
       setError(err.message);
       setPaying(false);
@@ -219,11 +313,11 @@ export default function CheckoutPage() {
   return (
     <div className="page-container py-8 animate-fade-in max-w-xl mx-auto">
 
-      <Link href={checkoutData ? `/events/${checkoutData.eventId}/seats` : '/events'}
+      {/* <Link href={checkoutData ? `/events/${checkoutData.eventId}/seats` : '/events'}
             className="text-sm no-underline mb-4 inline-block"
             style={{ color: 'var(--text-secondary)' }}>
         ← Back to Seat Map
-      </Link>
+      </Link> */}
 
       <h1 className="text-2xl font-bold mb-6">Checkout</h1>
 
@@ -292,27 +386,45 @@ export default function CheckoutPage() {
             </div>
           </div>
 
-          {/* ---- Pay Button ---- */}
-          <button
-            onClick={handlePay}
-            disabled={paying || isExpired || !order}
-            className="btn-primary w-full py-4 text-lg font-bold"
-            style={{ opacity: (paying || isExpired || !order) ? 0.5 : 1 }}
-          >
-            {paying ? (
-              <span className="flex items-center justify-center gap-2">
-                <div className="spinner" style={{ width: 20, height: 20 }}></div>
-                Processing...
-              </span>
-            ) : isExpired ? (
-              '⏰ Session Expired'
-            ) : (
-              `💳 Pay ₹${totalPrice.toLocaleString()} with Razorpay`
-            )}
-          </button>
+          {/* ---- Pay Buttons ---- */}
+          <div className="flex flex-col gap-3">
+            <button
+              onClick={handlePay}
+              disabled={paying || isExpired || !order}
+              className="btn-primary w-full py-4 text-lg font-bold"
+              style={{ opacity: (paying || isExpired || !order) ? 0.5 : 1 }}
+            >
+              {paying ? (
+                <span className="flex items-center justify-center gap-2">
+                  <div className="spinner" style={{ width: 20, height: 20 }}></div>
+                  Processing...
+                </span>
+              ) : isExpired ? (
+                '⏰ Session Expired'
+              ) : (
+                `💳 Pay ₹${totalPrice.toLocaleString()} with Razorpay`
+              )}
+            </button>
+
+            {/* Test Payment — auto-completes without Razorpay modal */}
+            <button
+              onClick={handleTestPayment}
+              disabled={paying || isExpired || !order}
+              className="w-full py-3 rounded-xl font-bold text-base transition-all"
+              style={{
+                background: 'linear-gradient(135deg, #10b981, #059669)',
+                color: 'white',
+                border: 'none',
+                cursor: (paying || isExpired || !order) ? 'not-allowed' : 'pointer',
+                opacity: (paying || isExpired || !order) ? 0.5 : 1,
+              }}
+            >
+              {paying ? 'Processing...' : `🧪 Test Payment (Auto-Complete)`}
+            </button>
+          </div>
 
           <p className="text-xs text-center mt-3" style={{ color: 'var(--text-muted)' }}>
-            Secure payment powered by Razorpay
+            Use "Test Payment" for instant auto-completion · No money charged
           </p>
         </>
       )}

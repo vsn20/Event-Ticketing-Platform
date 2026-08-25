@@ -73,11 +73,12 @@ async function request(method, path, body = null) {
   const options = {
     method,
     headers,
+    cache: 'no-store', // Prevent aggressive Next.js/browser caching of API data
   };
 
   // Only include a body for methods that support it.
-  // GET and DELETE typically don't have a request body.
-  if (body && (method === 'POST' || method === 'PATCH' || method === 'PUT')) {
+  // GET typically doesn't have a request body.
+  if (body && method !== 'GET') {
     options.body = JSON.stringify(body);
   }
 
@@ -113,7 +114,7 @@ const api = {
   get: (path) => request('GET', path),
   post: (path, body) => request('POST', path, body),
   patch: (path, body) => request('PATCH', path, body),
-  delete: (path) => request('DELETE', path),
+  delete: (path, body) => request('DELETE', path, body),
 };
 
 export default api;

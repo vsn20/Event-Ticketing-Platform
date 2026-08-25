@@ -11,8 +11,11 @@
 //     Score = join timestamp (ms), Value = customerId
 //     → FIFO ordering by join time
 //
-//   - Redis Set: admitted:{eventId}
-//     → Set of customer IDs currently admitted to buy tickets
+//   - Redis Sorted Set: admitted:{eventId}
+//     Score = expiry timestamp (ms), Value = customerId
+//     → Self-cleaning: expired members are swept before every
+//       count check, so abandoned sessions can never permanently
+//       occupy a slot.
 //
 //   - Threshold: max concurrent buyers per event (default: 200)
 //     Stored in Redis as: waiting_room_config:{eventId}
@@ -25,12 +28,23 @@
 //   3. When a buyer finishes (payment or timeout), call releaseSlot()
 //   4. releaseSlot() admits the next person from the queue
 //   5. Frontend polls getPosition() every few seconds
+//
+// PREVIOUS BUG (fixed):
+//   The old design used a Redis Set for admitted members plus a
+//   separate per-member TTL key (admitted_ttl:{eventId}:{customerId}).
+//   When the TTL key expired, Redis deleted it silently but the
+//   member stayed in the Set permanently — a "ghost slot" leak.
+//
+//   The new design uses a single Sorted Set where the score IS
+//   the expiry timestamp. Every admission check sweeps out expired
+//   members first (ZREMRANGEBYSCORE), so membership and expiry
+//   can never drift out of sync.
 // ============================================================
 
 const redis = require('../config/redis');
 
 const DEFAULT_THRESHOLD = 200; // max concurrent buyers
-const ADMITTED_TTL = 600;       // 10 minutes to complete purchase
+const ADMITTED_TTL = 600;       // 10 minutes to complete purchase (seconds)
 
 
 // ============================================================
@@ -56,6 +70,18 @@ async function setThreshold(eventId, threshold) {
 
 
 // ============================================================
+// sweepExpired(eventId)
+// ============================================================
+// Removes all expired members from admitted:{eventId}.
+// Called before every count check so ghost slots are cleaned
+// automatically — no background job or TTL callback needed.
+// ============================================================
+async function sweepExpired(eventId) {
+  await redis.zremrangebyscore(`admitted:${eventId}`, '-inf', Date.now());
+}
+
+
+// ============================================================
 // tryAdmit(eventId, customerId)
 // ============================================================
 // Main entry point. Checks if the customer can be admitted
@@ -68,22 +94,23 @@ async function setThreshold(eventId, threshold) {
 async function tryAdmit(eventId, customerId) {
   const customerStr = String(customerId);
 
-  // Already admitted? Let them through.
-  const alreadyAdmitted = await redis.sismember(`admitted:${eventId}`, customerStr);
-  if (alreadyAdmitted) {
+  // Sweep expired members first
+  await sweepExpired(eventId);
+
+  // Already admitted and not expired? Let them through.
+  const existingScore = await redis.zscore(`admitted:${eventId}`, customerStr);
+  if (existingScore !== null && Number(existingScore) > Date.now()) {
     return { admitted: true };
   }
 
-  // Check how many are currently admitted
-  const admittedCount = await redis.scard(`admitted:${eventId}`);
+  // Check how many are currently admitted (post-sweep)
+  const admittedCount = await redis.zcard(`admitted:${eventId}`);
   const threshold = await getThreshold(eventId);
 
   if (admittedCount < threshold) {
     // Room available — admit immediately
-    await redis.sadd(`admitted:${eventId}`, customerStr);
-    // Set a TTL on the admitted membership (auto-release if they abandon)
-    // We use a separate key for per-member TTL since sets don't support per-member TTL
-    await redis.set(`admitted_ttl:${eventId}:${customerStr}`, '1', 'EX', ADMITTED_TTL);
+    const expiresAt = Date.now() + (ADMITTED_TTL * 1000);
+    await redis.zadd(`admitted:${eventId}`, expiresAt, customerStr);
     return { admitted: true };
   }
 
@@ -114,9 +141,12 @@ async function tryAdmit(eventId, customerId) {
 async function getPosition(eventId, customerId) {
   const customerStr = String(customerId);
 
-  // Check if admitted
-  const isAdmitted = await redis.sismember(`admitted:${eventId}`, customerStr);
-  if (isAdmitted) {
+  // Sweep expired members first
+  await sweepExpired(eventId);
+
+  // Check if admitted (and not expired)
+  const existingScore = await redis.zscore(`admitted:${eventId}`, customerStr);
+  if (existingScore !== null && Number(existingScore) > Date.now()) {
     return { admitted: true };
   }
 
@@ -141,26 +171,28 @@ async function getPosition(eventId, customerId) {
 // releaseSlot(eventId, customerId)
 // ============================================================
 // Called when a customer finishes buying (payment success/fail)
-// or their admitted TTL expires. Removes them from the admitted
-// set and admits the next person from the queue.
+// or abandons. Removes them from the admitted sorted set and
+// admits the next person from the queue.
 // ============================================================
 async function releaseSlot(eventId, customerId) {
   const customerStr = String(customerId);
 
-  // Remove from admitted set
-  await redis.srem(`admitted:${eventId}`, customerStr);
-  await redis.del(`admitted_ttl:${eventId}:${customerStr}`);
+  // Remove from admitted sorted set
+  await redis.zrem(`admitted:${eventId}`, customerStr);
 
   // Also remove from queue if they were there
   await redis.zrem(`waiting_room:${eventId}`, customerStr);
+
+  // Sweep expired members while we're here
+  await sweepExpired(eventId);
 
   // Admit the next person from the queue
   const next = await redis.zrange(`waiting_room:${eventId}`, 0, 0);
   if (next && next.length > 0) {
     const nextCustomer = next[0];
     await redis.zrem(`waiting_room:${eventId}`, nextCustomer);
-    await redis.sadd(`admitted:${eventId}`, nextCustomer);
-    await redis.set(`admitted_ttl:${eventId}:${nextCustomer}`, '1', 'EX', ADMITTED_TTL);
+    const expiresAt = Date.now() + (ADMITTED_TTL * 1000);
+    await redis.zadd(`admitted:${eventId}`, expiresAt, nextCustomer);
   }
 
   return { released: true };
@@ -174,8 +206,9 @@ async function releaseSlot(eventId, customerId) {
 // customer is admitted before allowing seat selection.
 // ============================================================
 async function isAdmitted(eventId, customerId) {
-  const result = await redis.sismember(`admitted:${eventId}`, String(customerId));
-  return !!result;
+  const score = await redis.zscore(`admitted:${eventId}`, String(customerId));
+  // Admitted only if present AND not expired
+  return score !== null && Number(score) > Date.now();
 }
 
 

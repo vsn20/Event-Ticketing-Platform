@@ -191,16 +191,19 @@ async function getSeatMap(eventId, seatIds) {
 
 
 // ============================================================
-// acquireSeats(eventId, seatIds, holdId)
+// acquireSeats(eventId, seatIds, holdId, ttl?)
 // ============================================================
 // Atomic all-or-nothing seat acquisition using Lua.
 //
 // Every seat must be AVAILABLE. If even one is not, none are
-// acquired. Sets HELD:{holdId} with 10-min TTL.
+// acquired. Sets HELD:{holdId} with the given TTL.
+//
+// ttl defaults to SELECTION_TTL (600s). Pass the remaining
+// session TTL to keep seat keys in sync with the session.
 //
 // Returns: { success: true } or { success: false, message: '...' }
 // ============================================================
-async function acquireSeats(eventId, seatIds, holdId) {
+async function acquireSeats(eventId, seatIds, holdId, ttl = SELECTION_TTL) {
   const keys = seatIds.map(id => seatKey(eventId, id));
   const holdValue = `HELD:${holdId}`;
 
@@ -209,7 +212,7 @@ async function acquireSeats(eventId, seatIds, holdId) {
     keys.length,
     ...keys,
     holdValue,
-    String(SELECTION_TTL)
+    String(ttl)
   );
 
   if (result === 1) {
