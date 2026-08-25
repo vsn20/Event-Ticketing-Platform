@@ -248,6 +248,9 @@ export default function CheckoutPage() {
         sessionStorage.removeItem(`booking_session_${checkoutData.eventId}`);
       }
       clearInterval(timerRef.current);
+      
+      // Prevent the unmount effect from cancelling the order
+      redirectedRef.current = true;
       router.push(`/confirmation/${order.orderId}`);
     } catch (err) {
       setError(err.message);
