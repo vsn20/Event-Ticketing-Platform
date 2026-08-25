@@ -43,7 +43,7 @@
 
 const redis = require('../config/redis');
 
-const DEFAULT_THRESHOLD = 200; // max concurrent buyers
+const DEFAULT_THRESHOLD = 3; // max concurrent buyers
 const ADMITTED_TTL = 600;       // 10 minutes to complete purchase (seconds)
 
 

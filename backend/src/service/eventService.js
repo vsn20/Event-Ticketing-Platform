@@ -319,7 +319,11 @@ async function updateEvent(eventId, orgId, updates) {
   // Step 1: Verify the event exists and belongs to this organizer
   // ----------------------------------------------------------
   const eventCheck = await pool.query(
-    'SELECT event_id, org_id FROM events WHERE event_id = $1',
+    `SELECT e.event_id, e.org_id, e.venue_id, e.event_start_time, e.event_end_time,
+            e.buffer_hours_before, e.buffer_hours_after, v.venue_name
+     FROM events e
+     JOIN venues v ON e.venue_id = v.venue_id
+     WHERE e.event_id = $1`,
     [eventId]
   );
 
@@ -327,8 +331,48 @@ async function updateEvent(eventId, orgId, updates) {
     throw new Error(`Event with ID ${eventId} not found`);
   }
 
-  if (eventCheck.rows[0].org_id !== orgId) {
+  const existingEvent = eventCheck.rows[0];
+
+  if (existingEvent.org_id !== orgId) {
     throw new Error('You do not have permission to edit this event');
+  }
+
+  // ----------------------------------------------------------
+  // Step 1b: If times are updated, check for venue conflicts.
+  // ----------------------------------------------------------
+  const newStartTime = updates.startTime !== undefined ? updates.startTime : existingEvent.event_start_time;
+  const newEndTime = updates.endTime !== undefined ? updates.endTime : existingEvent.event_end_time;
+  const newBufferBefore = updates.bufferHoursBefore !== undefined ? updates.bufferHoursBefore : existingEvent.buffer_hours_before;
+  const newBufferAfter = updates.bufferHoursAfter !== undefined ? updates.bufferHoursAfter : existingEvent.buffer_hours_after;
+
+  if (updates.startTime !== undefined || updates.endTime !== undefined ||
+      updates.bufferHoursBefore !== undefined || updates.bufferHoursAfter !== undefined) {
+    
+    const conflictCheck = await pool.query(
+      `SELECT e.event_id, e.event_name,
+              e.event_start_time, e.event_end_time
+       FROM events e
+       WHERE e.venue_id = $1
+         AND e.event_id != $2
+         AND e.status != 'closed'
+         AND (
+           (e.event_start_time - (COALESCE(e.buffer_hours_before, 2) || ' hours')::interval) < ($4::timestamp + ($6 || ' hours')::interval)
+           AND
+           (e.event_end_time + (COALESCE(e.buffer_hours_after, 2) || ' hours')::interval) > ($3::timestamp - ($5 || ' hours')::interval)
+         )`,
+      [existingEvent.venue_id, eventId, newStartTime, newEndTime, newBufferBefore, newBufferAfter]
+    );
+
+    if (conflictCheck.rows.length > 0) {
+      const conflict = conflictCheck.rows[0];
+      const conflictStart = new Date(conflict.event_start_time).toLocaleString('en-IN');
+      const conflictEnd = new Date(conflict.event_end_time).toLocaleString('en-IN');
+      throw new Error(
+        `Venue "${existingEvent.venue_name}" is already booked! ` +
+        `"${conflict.event_name}" runs from ${conflictStart} to ${conflictEnd}. ` +
+        `With buffer time, the venue is blocked. Choose a different time.`
+      );
+    }
   }
 
   // ----------------------------------------------------------
